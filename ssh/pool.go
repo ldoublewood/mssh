@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -252,13 +253,19 @@ func (p *Pool) StartShell(host *config.Host) error {
 		return fmt.Errorf("启动shell失败: %v", err)
 	}
 
+	// 加载历史命令
+	historyCmds := p.loadHostHistory(host.Name)
+
 	// 启动goroutine转发stdout和stderr
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	done := make(chan struct{})
+
 	go func() {
 		defer wg.Done()
 		io.Copy(os.Stdout, stdoutPipe)
+		close(done) // stdout结束时通知stdin转发退出
 	}()
 
 	go func() {
@@ -267,7 +274,10 @@ func (p *Pool) StartShell(host *config.Host) error {
 	}()
 
 	// 读取stdin并检测Ctrl+R
-	err = p.forwardStdinWithHistory(stdinPipe, host.Name)
+	err = p.forwardStdinWithHistory(stdinPipe, host.Name, historyCmds, done)
+
+	// 关闭stdin管道，通知远程shell输入结束
+	stdinPipe.Close()
 
 	// 等待输出转发完成
 	wg.Wait()
@@ -276,49 +286,121 @@ func (p *Pool) StartShell(host *config.Host) error {
 }
 
 // forwardStdinWithHistory 转发stdin到远程，并拦截Ctrl+R进行历史搜索
-func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string) error {
-	// 读取本地历史文件
-	historyCmds := p.loadHostHistory(hostName)
+func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string, historyCmds []string, done chan struct{}) error {
+	// 如果没有历史命令，直接转发
+	if len(historyCmds) == 0 {
+		_, err := io.Copy(stdinPipe, os.Stdin)
+		return err
+	}
 
 	buf := make([]byte, 1024)
+	inSearchMode := false
+	searchTerm := ""
+	matchIndex := 0
+	var matches []string
+
 	for {
+		// 检查是否需要退出
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+
+		// 设置超时读取，避免阻塞
+		os.Stdin.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		n, err := os.Stdin.Read(buf)
+		os.Stdin.SetReadDeadline(time.Time{})
+
 		if err != nil {
+			// 检查是否是超时或其他可恢复错误
+			if pathErr, ok := err.(*os.PathError); ok {
+				if errno, ok := pathErr.Err.(syscall.Errno); ok && errno == syscall.EAGAIN {
+					continue
+				}
+			}
+			// 其他错误（如EOF）退出
 			return err
 		}
 
-		// 检测Ctrl+R (0x12)
-		ctrlRIndex := -1
-		for i := 0; i < n; i++ {
-			if buf[i] == 0x12 { // Ctrl+R
-				ctrlRIndex = i
-				break
-			}
+		if n == 0 {
+			continue
 		}
 
-		if ctrlRIndex != -1 {
-			// 发送Ctrl+R之前的数据
-			if ctrlRIndex > 0 {
-				stdinPipe.Write(buf[:ctrlRIndex])
+		i := 0
+		for i < n {
+			ch := buf[i]
+
+			// 检测Ctrl+R (0x12) - 进入或继续搜索
+			if ch == 0x12 {
+				if !inSearchMode {
+					inSearchMode = true
+					searchTerm = ""
+					matchIndex = 0
+					matches = p.findMatches(historyCmds, searchTerm)
+					p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
+				} else {
+					if len(matches) > 0 {
+						matchIndex = (matchIndex + 1) % len(matches)
+						p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
+					}
+				}
+				i++
+				continue
 			}
 
-			// 显示历史搜索界面
-			selectedCmd := p.showHistorySearch(historyCmds, hostName)
-			if selectedCmd != "" {
-				// 发送选中的命令到远程shell
-				stdinPipe.Write([]byte(selectedCmd + "\n"))
+			// 检测Ctrl+G (0x07) 或 Ctrl+C (0x03) - 取消搜索
+			if (ch == 0x07 || ch == 0x03) && inSearchMode {
+				inSearchMode = false
+				searchTerm = ""
+				matches = nil
+				fmt.Printf("\r\n")
+				i++
+				continue
 			}
 
-			// 发送剩余数据
-			if ctrlRIndex+1 < n {
-				stdinPipe.Write(buf[ctrlRIndex+1:])
+			// 检测回车 - 执行匹配的命令
+			if (ch == '\r' || ch == '\n') && inSearchMode {
+				if len(matches) > 0 && matchIndex < len(matches) {
+					selectedCmd := matches[matchIndex]
+					inSearchMode = false
+					searchTerm = ""
+					matches = nil
+					fmt.Printf("\r\n")
+					stdinPipe.Write([]byte(selectedCmd + "\n"))
+				} else {
+					inSearchMode = false
+					fmt.Printf("\r\n")
+				}
+				i++
+				continue
 			}
-		} else {
-			// 正常转发
-			_, err = stdinPipe.Write(buf[:n])
-			if err != nil {
-				return err
+
+			// 检测退格 - 删除搜索字符
+			if (ch == 0x7F || ch == 0x08) && inSearchMode {
+				if len(searchTerm) > 0 {
+					searchTerm = searchTerm[:len(searchTerm)-1]
+					matches = p.findMatches(historyCmds, searchTerm)
+					matchIndex = 0
+					p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
+				}
+				i++
+				continue
 			}
+
+			// 在搜索模式下，普通字符添加到搜索词
+			if inSearchMode && ch >= 32 && ch < 127 {
+				searchTerm += string(ch)
+				matches = p.findMatches(historyCmds, searchTerm)
+				matchIndex = 0
+				p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
+				i++
+				continue
+			}
+
+			// 其他情况：正常转发到远程
+			stdinPipe.Write([]byte{ch})
+			i++
 		}
 	}
 }
@@ -346,130 +428,51 @@ func (p *Pool) loadHostHistory(hostName string) []string {
 		}
 	}
 
+	// 倒序排列（最新的在前）
+	for i, j := 0, len(cmds)-1; i < j; i, j = i+1, j-1 {
+		cmds[i], cmds[j] = cmds[j], cmds[i]
+	}
+
 	return cmds
 }
 
-// showHistorySearch 显示历史搜索界面
-func (p *Pool) showHistorySearch(historyCmds []string, hostName string) string {
-	if len(historyCmds) == 0 {
-		fmt.Printf("\r\n[mssh] 没有 [%s] 的历史命令\r\n", hostName)
-		return ""
-	}
-
-	fmt.Printf("\r\n[mssh] [%s] 历史命令搜索 (输入关键词过滤, 回车选择, Ctrl+C取消):\r\n", hostName)
-
-	// 使用简单的方式读取输入，避免复杂的终端模式切换
-	searchTerm := ""
-	buf := make([]byte, 1)
-
-	for {
-		// 显示当前搜索结果
-		fmt.Printf("\r\n搜索: %s\r\n", searchTerm)
-
-		// 过滤并显示匹配的历史命令
-		matches := p.filterHistory(historyCmds, searchTerm)
-		if len(matches) == 0 {
-			fmt.Println("没有匹配的命令")
-		} else {
-			fmt.Printf("找到 %d 条匹配命令:\r\n", len(matches))
-			for i, cmd := range matches {
-				if i >= 10 {
-					fmt.Printf("... 还有 %d 条\r\n", len(matches)-10)
-					break
-				}
-				// 高亮匹配部分
-				highlighted := p.highlightMatch(cmd, searchTerm)
-				fmt.Printf("  [%d] %s\r\n", i+1, highlighted)
-			}
-		}
-
-		fmt.Print("\r\n输入关键词或序号 (退格删除, 回车确认): ")
-
-		// 逐字符读取输入
-		inputBuffer := []byte{}
-		for {
-			// 设置超时读取，避免阻塞
-			os.Stdin.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, err := os.Stdin.Read(buf)
-			os.Stdin.SetReadDeadline(time.Time{})
-
-			if err != nil {
-				// 超时，继续
-				continue
-			}
-
-			if n == 0 {
-				continue
-			}
-
-			ch := buf[0]
-
-			// 处理特殊键
-			switch ch {
-			case '\r', '\n': // 回车
-				input := strings.TrimSpace(string(inputBuffer))
-
-				// 检查是否是数字选择
-				var num int
-				if _, err := fmt.Sscanf(input, "%d", &num); err == nil && num > 0 && num <= len(matches) {
-					fmt.Printf("\r\n")
-					return matches[num-1]
-				}
-
-				// 检查是否是取消
-				if input == "" || input == "q" || input == "quit" {
-					fmt.Printf("\r\n")
-					return ""
-				}
-
-				// 更新搜索词，重新显示
-				searchTerm = input
-				break // 跳出内层循环，重新显示搜索结果
-
-			case 0x03: // Ctrl+C
-				fmt.Printf("\r\n")
-				return ""
-
-			case 0x7F, 0x08: // 退格/Backspace
-				if len(inputBuffer) > 0 {
-					inputBuffer = inputBuffer[:len(inputBuffer)-1]
-					// 刷新显示
-					fmt.Printf("\b \b")
-				}
-
-			default:
-				// 普通字符
-				if ch >= 32 && ch < 127 { // 可打印字符
-					inputBuffer = append(inputBuffer, ch)
-					fmt.Printf("%c", ch)
-				}
-			}
-		}
-	}
-}
-
-// filterHistory 根据搜索词过滤历史命令
-func (p *Pool) filterHistory(cmds []string, searchTerm string) []string {
+// findMatches 查找匹配的历史命令
+func (p *Pool) findMatches(historyCmds []string, searchTerm string) []string {
 	if searchTerm == "" {
-		// 返回最近的命令（倒序）
-		result := make([]string, len(cmds))
-		for i := range cmds {
-			result[i] = cmds[len(cmds)-1-i]
-		}
-		return result
+		return historyCmds
 	}
 
-	var matches []string
 	searchLower := strings.ToLower(searchTerm)
+	var matches []string
 
-	// 从后往前搜索，显示最近的匹配
-	for i := len(cmds) - 1; i >= 0; i-- {
-		if strings.Contains(strings.ToLower(cmds[i]), searchLower) {
-			matches = append(matches, cmds[i])
+	for _, cmd := range historyCmds {
+		if strings.Contains(strings.ToLower(cmd), searchLower) {
+			matches = append(matches, cmd)
 		}
 	}
 
 	return matches
+}
+
+// showSearchStatus 显示搜索状态（类似bash的反向搜索）
+func (p *Pool) showSearchStatus(searchTerm string, matches []string, matchIndex int, hostName string) {
+	// 清除当前行
+	fmt.Printf("\r\033[K")
+
+	if len(matches) == 0 {
+		if searchTerm == "" {
+			fmt.Printf("(reverse-i-search)[%s]: ", hostName)
+		} else {
+			fmt.Printf("(failed reverse-i-search)`%s': ", searchTerm)
+		}
+	} else {
+		matchedCmd := matches[matchIndex]
+		// 高亮匹配部分
+		highlighted := p.highlightMatch(matchedCmd, searchTerm)
+
+		// 显示格式: (reverse-i-search)`search': matched_command
+		fmt.Printf("(reverse-i-search)`%s': %s", searchTerm, highlighted)
+	}
 }
 
 // highlightMatch 高亮匹配的部分
@@ -481,28 +484,17 @@ func (p *Pool) highlightMatch(cmd, searchTerm string) string {
 	searchLower := strings.ToLower(searchTerm)
 	cmdLower := strings.ToLower(cmd)
 
-	var result strings.Builder
-	lastIdx := 0
-
-	for {
-		idx := strings.Index(cmdLower[lastIdx:], searchLower)
-		if idx == -1 {
-			result.WriteString(cmd[lastIdx:])
-			break
-		}
-		idx += lastIdx
-
-		// 写入匹配前的部分
-		result.WriteString(cmd[lastIdx:idx])
-		// 高亮匹配部分 (使用ANSI颜色)
-		result.WriteString("\x1b[1;33m") // 黄色加粗
-		result.WriteString(cmd[idx : idx+len(searchTerm)])
-		result.WriteString("\x1b[0m") // 重置
-
-		lastIdx = idx + len(searchTerm)
+	idx := strings.Index(cmdLower, searchLower)
+	if idx == -1 {
+		return cmd
 	}
 
-	return result.String()
+	// 使用ANSI颜色高亮匹配部分 (黄色加粗背景)
+	before := cmd[:idx]
+	match := cmd[idx : idx+len(searchTerm)]
+	after := cmd[idx+len(searchTerm):]
+
+	return fmt.Sprintf("%s\x1b[1;33m%s\x1b[0m%s", before, match, after)
 }
 
 // GetSession 获取新的session
