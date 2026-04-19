@@ -95,7 +95,7 @@ func (e *Executor) isRemoteCommand(input string) bool {
 
 // isBuiltInCommand 检查是否是内置命令
 func (e *Executor) isBuiltInCommand(input string) bool {
-	builtins := []string{"help", "hosts", "groups", "exit", "quit", "concurrent", "sequential"}
+	builtins := []string{"help", "hosts", "groups", "exit", "quit", "q", "concurrent", "sequential"}
 	cmd := strings.Fields(input)[0]
 	for _, b := range builtins {
 		if cmd == b {
@@ -120,7 +120,7 @@ func (e *Executor) executeBuiltIn(input string) error {
 		e.listHosts()
 	case "groups":
 		e.listGroups()
-	case "exit", "quit":
+	case "exit", "quit", "q":
 		return fmt.Errorf("EXIT")
 	case "concurrent":
 		e.concurrent = true
@@ -387,7 +387,7 @@ func (e *Executor) showHelp() {
   groups              - 列出所有组
   concurrent          - 切换到并发模式（默认）
   sequential          - 切换到顺序模式
-  exit/quit           - 退出程序
+  exit/quit/q         - 退出程序
 
 示例:
   web1: uname -a                    - 在web1执行命令
