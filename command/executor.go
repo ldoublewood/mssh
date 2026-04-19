@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -290,12 +291,21 @@ func (e *Executor) executeLogin(hostName string) error {
 	e.currentHost = hostName
 	e.history.SetHost(hostName)
 
+	// 创建并启动rsync历史同步器
+	homeDir, _ := os.UserHomeDir()
+	historyBaseDir := filepath.Join(homeDir, ".mssh_history")
+	rsyncer := history.NewRsyncSyncer(host, historyBaseDir)
+	rsyncer.Start()
+
 	// 进入交互模式
 	oldPrompt := e.rl.Config.Prompt
 	e.rl.Config.Prompt = fmt.Sprintf("[%s] ", hostName)
 
 	// 启动远程shell
 	err := e.pool.StartShell(host)
+
+	// 停止同步器并执行最后一次同步
+	rsyncer.Stop()
 
 	// 恢复提示符
 	e.rl.Config.Prompt = oldPrompt
