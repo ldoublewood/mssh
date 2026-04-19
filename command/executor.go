@@ -3,7 +3,6 @@ package command
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -13,6 +12,7 @@ import (
 
 	"mssh/config"
 	"mssh/history"
+	"mssh/shell"
 	"mssh/ssh"
 	"mssh/transfer"
 )
@@ -23,6 +23,7 @@ type Executor struct {
 	pool        *ssh.Pool
 	history     *history.Manager
 	transfer    *transfer.TransferManager
+	localShell  *shell.Executor
 	rl          *readline.Instance
 	concurrent  bool
 	currentHost string // 当前登录的主机（用于交互模式）
@@ -35,6 +36,7 @@ func NewExecutor(cfg *config.Config, pool *ssh.Pool, hist *history.Manager) *Exe
 		pool:       pool,
 		history:    hist,
 		transfer:   transfer.NewTransferManager(pool),
+		localShell: shell.NewExecutor(),
 		concurrent: true,
 	}
 }
@@ -362,18 +364,9 @@ func (e *Executor) executeTransfer(direction, hostOrGroup, localPath, remotePath
 }
 
 // executeLocalCommand 执行本地系统命令
+// 使用本地 shell 执行器，支持所有 shell 内置命令和状态保持
 func (e *Executor) executeLocalCommand(input string) error {
-	args := strings.Fields(input)
-	if len(args) == 0 {
-		return nil
-	}
-
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	return cmd.Run()
+	return e.localShell.Execute(input)
 }
 
 // showHelp 显示帮助信息
@@ -429,11 +422,14 @@ func (e *Executor) listGroups() {
 }
 
 // GetPrompt 获取当前提示符
+// 本地模式显示 [mssh] 前缀的 shell 提示符
+// 远程模式显示 [hostname] 前缀
 func (e *Executor) GetPrompt() string {
 	if e.currentHost != "" {
 		return fmt.Sprintf("[%s] ", e.currentHost)
 	}
-	return "mssh> "
+	// 使用本地 shell 的提示符
+	return e.localShell.GetPrompt()
 }
 
 // IsInRemoteMode 是否在远程交互模式
