@@ -91,14 +91,48 @@ func (r *RsyncSyncer) Stop() {
 	close(r.stopCh)
 	r.wg.Wait()
 
-	// 执行最后一次同步
+	// 执行最后一次同步（失败只记录日志，不报错）
 	r.logger.Println("[历史同步] 执行最后一次同步...")
-	r.sync()
+	if err := r.syncWithRetry(2); err != nil {
+		r.logger.Printf("[历史同步] 最后一次同步失败（连接可能已关闭）: %v\n", err)
+	}
 	
 	// 关闭日志文件
 	if r.logFile != nil && r.logFile != os.Stderr {
 		r.logFile.Close()
 	}
+}
+
+// syncWithRetry 带重试的同步
+func (r *RsyncSyncer) syncWithRetry(maxRetries int) error {
+	if r.remoteFile == "" {
+		return nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	localFile := filepath.Join(r.localDir, filepath.Base(r.remoteFile))
+
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		if r.rsyncAvailable {
+			lastErr = r.syncWithRsync(localFile)
+		} else {
+			lastErr = r.syncWithSCP(localFile)
+		}
+		
+		if lastErr == nil {
+			r.lastSyncTime = time.Now()
+			return nil
+		}
+		
+		if i < maxRetries-1 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	
+	return lastErr
 }
 
 // syncLoop 定期同步循环

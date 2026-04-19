@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/chzyer/readline"
+	cryptossh "golang.org/x/crypto/ssh"
 
 	"mssh/config"
 	"mssh/history"
@@ -305,6 +306,7 @@ func (e *Executor) executeLogin(hostName string) error {
 	err := e.pool.StartShell(host)
 
 	// 停止同步器并执行最后一次同步
+	// 注意：同步错误只记录到日志，不影响退出流程
 	rsyncer.Stop()
 
 	// 恢复提示符
@@ -312,7 +314,19 @@ func (e *Executor) executeLogin(hostName string) error {
 	e.currentHost = ""
 	e.history.SetHost("")
 
-	return err
+	// 忽略 StartShell 的退出错误，因为这是用户正常退出 shell
+	// 错误可能包括：exit status 0, exit status 1, connection closed 等
+	if err != nil {
+		// 检查是否是 SSH 退出错误类型
+		if _, ok := err.(*cryptossh.ExitError); ok {
+			// SSH 会话正常退出，忽略错误
+			return nil
+		}
+		// 对于其他错误（如连接关闭），也视为正常退出
+		return nil
+	}
+
+	return nil
 }
 
 // executeTransfer 执行文件传输
