@@ -1,0 +1,29 @@
+# 主机配置文件 hosts.ini
+# 格式: 主机名 = 用户名@IP:端口 (端口可选，默认22)
+# 组定义使用 [组名] 格式
+
+# Web服务器组
+[webservers]
+web1 = admin@192.168.1.10:22
+web2 = admin@192.168.1.11
+web3 = admin@192.168.1.12
+
+# 数据库服务器组
+[dbservers]
+db1 = root@192.168.2.10
+db2 = root@192.168.2.11
+
+# 缓存服务器组
+[cacheservers]
+cache1 = ubuntu@192.168.3.10
+
+# 可以定义包含其他组的父组（嵌套组）
+[production]
+# 子组通过引用其他组名称实现
+# 在命令执行时会递归展开
+# webservers
+# dbservers
+
+# 未分组的主机
+backup = backup@192.168.4.10:2222
+monitor = monitor@192.168.4.20
