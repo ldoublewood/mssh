@@ -334,7 +334,6 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 					searchTerm = ""
 					matchIndex = 0
 					matches = p.findMatches(historyEntries, searchTerm)
-					fmt.Printf("\r\n")
 					p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
 				} else {
 					// 已经在搜索模式，跳到下一个匹配
@@ -352,7 +351,7 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 				inSearchMode = false
 				searchTerm = ""
 				matches = nil
-				fmt.Printf("\r\n")
+				fmt.Printf("\r\n\r")
 				i++
 				continue
 			}
@@ -364,11 +363,11 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 					inSearchMode = false
 					searchTerm = ""
 					matches = nil
-					fmt.Printf("\r\n")
+					fmt.Printf("\r\n\r")
 					stdinPipe.Write([]byte(selectedCmd + "\n"))
 				} else {
 					inSearchMode = false
-					fmt.Printf("\r\n")
+					fmt.Printf("\r\n\r")
 				}
 				i++
 				continue
@@ -437,9 +436,23 @@ func (p *Pool) loadAllHostsHistory() []HistoryEntry {
 			continue
 		}
 
-		historyFile := filepath.Join(historyDir, hostName, "history.txt")
-		file, err := os.Open(historyFile)
-		if err != nil {
+		// 尝试读取 .bash_history 或 .zsh_history
+		historyFiles := []string{
+			filepath.Join(historyDir, hostName, ".bash_history"),
+			filepath.Join(historyDir, hostName, ".zsh_history"),
+			filepath.Join(historyDir, hostName, "history.txt"), // 兼容旧格式
+		}
+
+		var file *os.File
+		for _, hf := range historyFiles {
+			f, err := os.Open(hf)
+			if err == nil {
+				file = f
+				break
+			}
+		}
+
+		if file == nil {
 			continue
 		}
 
@@ -447,10 +460,19 @@ func (p *Pool) loadAllHostsHistory() []HistoryEntry {
 		for scanner.Scan() {
 			cmd := strings.TrimSpace(scanner.Text())
 			if cmd != "" {
-				allEntries = append(allEntries, HistoryEntry{
-					Command: cmd,
-					Host:    hostName,
-				})
+				// zsh 历史格式可能有时间戳前缀，如 : 1234567890:0;command
+				if strings.HasPrefix(cmd, ":") {
+					parts := strings.SplitN(cmd, ";", 2)
+					if len(parts) == 2 {
+						cmd = strings.TrimSpace(parts[1])
+					}
+				}
+				if cmd != "" {
+					allEntries = append(allEntries, HistoryEntry{
+						Command: cmd,
+						Host:    hostName,
+					})
+				}
 			}
 		}
 		file.Close()
@@ -483,21 +505,24 @@ func (p *Pool) findMatches(historyEntries []HistoryEntry, searchTerm string) []H
 }
 
 // showSearchStatus 显示搜索状态（类似bash的反向搜索）
+// 使用\r回到行首覆盖上一行，实现单行更新
 func (p *Pool) showSearchStatus(searchTerm string, matches []HistoryEntry, matchIndex int, currentHost string) {
-	// 简单输出，不使用复杂的ANSI序列
+	// 清除整行并回到行首
+	fmt.Printf("\r\033[2K")
+
 	if len(matches) == 0 {
 		if searchTerm == "" {
-			fmt.Printf("\n[mssh] (reverse-i-search)[all-hosts]: ")
+			fmt.Printf("(reverse-i-search)[all-hosts]: ")
 		} else {
-			fmt.Printf("\n[mssh] (failed reverse-i-search)`%s': ", searchTerm)
+			fmt.Printf("(failed reverse-i-search)`%s': ", searchTerm)
 		}
 	} else {
 		matchedEntry := matches[matchIndex]
 		// 高亮匹配部分
 		highlighted := p.highlightMatch(matchedEntry.Command, searchTerm)
 
-		// 显示格式: [mssh] (reverse-i-search)`search': [host] command
-		fmt.Printf("\n[mssh] (reverse-i-search)`%s': [%s] %s", searchTerm, matchedEntry.Host, highlighted)
+		// 显示格式: (reverse-i-search)`search': [host] command
+		fmt.Printf("(reverse-i-search)`%s': [%s] %s", searchTerm, matchedEntry.Host, highlighted)
 	}
 }
 
