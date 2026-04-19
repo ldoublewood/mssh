@@ -253,8 +253,8 @@ func (p *Pool) StartShell(host *config.Host) error {
 		return fmt.Errorf("启动shell失败: %v", err)
 	}
 
-	// 加载历史命令
-	historyCmds := p.loadHostHistory(host.Name)
+	// 加载所有主机的历史命令
+	historyEntries := p.loadAllHostsHistory()
 
 	// 启动goroutine转发stdout和stderr
 	var wg sync.WaitGroup
@@ -274,7 +274,7 @@ func (p *Pool) StartShell(host *config.Host) error {
 	}()
 
 	// 读取stdin并检测Ctrl+R
-	err = p.forwardStdinWithHistory(stdinPipe, host.Name, historyCmds, done)
+	err = p.forwardStdinWithHistory(stdinPipe, host.Name, historyEntries, done)
 
 	// 关闭stdin管道，通知远程shell输入结束
 	stdinPipe.Close()
@@ -286,18 +286,13 @@ func (p *Pool) StartShell(host *config.Host) error {
 }
 
 // forwardStdinWithHistory 转发stdin到远程，并拦截Ctrl+R进行历史搜索
-func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string, historyCmds []string, done chan struct{}) error {
-	// 如果没有历史命令，直接转发
-	if len(historyCmds) == 0 {
-		_, err := io.Copy(stdinPipe, os.Stdin)
-		return err
-	}
+func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string, historyEntries []HistoryEntry, done chan struct{}) error {
 
 	buf := make([]byte, 1024)
 	inSearchMode := false
 	searchTerm := ""
 	matchIndex := 0
-	var matches []string
+	var matches []HistoryEntry
 
 	for {
 		// 检查是否需要退出
@@ -331,23 +326,26 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 		for i < n {
 			ch := buf[i]
 
-			// 检测Ctrl+R (0x12) - 进入或继续搜索
+		// 检测Ctrl+R (0x12) - 进入或继续搜索
 			if ch == 0x12 {
 				if !inSearchMode {
+					// 首次进入搜索模式
 					inSearchMode = true
 					searchTerm = ""
 					matchIndex = 0
-					matches = p.findMatches(historyCmds, searchTerm)
+					matches = p.findMatches(historyEntries, searchTerm)
+					fmt.Printf("\r\n")
 					p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
 				} else {
+					// 已经在搜索模式，跳到下一个匹配
 					if len(matches) > 0 {
 						matchIndex = (matchIndex + 1) % len(matches)
 						p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
 					}
 				}
-				i++
-				continue
-			}
+			i++
+			continue
+		}
 
 			// 检测Ctrl+G (0x07) 或 Ctrl+C (0x03) - 取消搜索
 			if (ch == 0x07 || ch == 0x03) && inSearchMode {
@@ -362,7 +360,7 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 			// 检测回车 - 执行匹配的命令
 			if (ch == '\r' || ch == '\n') && inSearchMode {
 				if len(matches) > 0 && matchIndex < len(matches) {
-					selectedCmd := matches[matchIndex]
+					selectedCmd := matches[matchIndex].Command
 					inSearchMode = false
 					searchTerm = ""
 					matches = nil
@@ -380,7 +378,7 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 			if (ch == 0x7F || ch == 0x08) && inSearchMode {
 				if len(searchTerm) > 0 {
 					searchTerm = searchTerm[:len(searchTerm)-1]
-					matches = p.findMatches(historyCmds, searchTerm)
+					matches = p.findMatches(historyEntries, searchTerm)
 					matchIndex = 0
 					p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
 				}
@@ -391,7 +389,7 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 			// 在搜索模式下，普通字符添加到搜索词
 			if inSearchMode && ch >= 32 && ch < 127 {
 				searchTerm += string(ch)
-				matches = p.findMatches(historyCmds, searchTerm)
+				matches = p.findMatches(historyEntries, searchTerm)
 				matchIndex = 0
 				p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
 				i++
@@ -405,49 +403,79 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 	}
 }
 
-// loadHostHistory 加载指定主机的历史命令
-func (p *Pool) loadHostHistory(hostName string) []string {
+// HistoryEntry 历史命令条目，包含命令和来源主机
+type HistoryEntry struct {
+	Command string
+	Host    string
+}
+
+// loadAllHostsHistory 加载所有主机的历史命令
+func (p *Pool) loadAllHostsHistory() []HistoryEntry {
 	usr, err := user.Current()
 	if err != nil {
 		return nil
 	}
 
-	historyFile := filepath.Join(usr.HomeDir, ".mssh_history", hostName, "history.txt")
-	file, err := os.Open(historyFile)
+	historyDir := filepath.Join(usr.HomeDir, ".mssh_history")
+
+	// 读取历史目录下的所有子目录（主机）
+	entries, err := os.ReadDir(historyDir)
 	if err != nil {
 		return nil
 	}
-	defer file.Close()
 
-	var cmds []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		cmd := strings.TrimSpace(scanner.Text())
-		if cmd != "" {
-			cmds = append(cmds, cmd)
+	var allEntries []HistoryEntry
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
 		}
+
+		hostName := entry.Name()
+		// 跳过logs目录
+		if hostName == "logs" {
+			continue
+		}
+
+		historyFile := filepath.Join(historyDir, hostName, "history.txt")
+		file, err := os.Open(historyFile)
+		if err != nil {
+			continue
+		}
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			cmd := strings.TrimSpace(scanner.Text())
+			if cmd != "" {
+				allEntries = append(allEntries, HistoryEntry{
+					Command: cmd,
+					Host:    hostName,
+				})
+			}
+		}
+		file.Close()
 	}
 
 	// 倒序排列（最新的在前）
-	for i, j := 0, len(cmds)-1; i < j; i, j = i+1, j-1 {
-		cmds[i], cmds[j] = cmds[j], cmds[i]
+	for i, j := 0, len(allEntries)-1; i < j; i, j = i+1, j-1 {
+		allEntries[i], allEntries[j] = allEntries[j], allEntries[i]
 	}
 
-	return cmds
+	return allEntries
 }
 
-// findMatches 查找匹配的历史命令
-func (p *Pool) findMatches(historyCmds []string, searchTerm string) []string {
+// findMatches 查找匹配的历史命令（返回HistoryEntry列表）
+func (p *Pool) findMatches(historyEntries []HistoryEntry, searchTerm string) []HistoryEntry {
 	if searchTerm == "" {
-		return historyCmds
+		return historyEntries
 	}
 
 	searchLower := strings.ToLower(searchTerm)
-	var matches []string
+	var matches []HistoryEntry
 
-	for _, cmd := range historyCmds {
-		if strings.Contains(strings.ToLower(cmd), searchLower) {
-			matches = append(matches, cmd)
+	for _, entry := range historyEntries {
+		if strings.Contains(strings.ToLower(entry.Command), searchLower) {
+			matches = append(matches, entry)
 		}
 	}
 
@@ -455,23 +483,21 @@ func (p *Pool) findMatches(historyCmds []string, searchTerm string) []string {
 }
 
 // showSearchStatus 显示搜索状态（类似bash的反向搜索）
-func (p *Pool) showSearchStatus(searchTerm string, matches []string, matchIndex int, hostName string) {
-	// 清除当前行
-	fmt.Printf("\r\033[K")
-
+func (p *Pool) showSearchStatus(searchTerm string, matches []HistoryEntry, matchIndex int, currentHost string) {
+	// 简单输出，不使用复杂的ANSI序列
 	if len(matches) == 0 {
 		if searchTerm == "" {
-			fmt.Printf("(reverse-i-search)[%s]: ", hostName)
+			fmt.Printf("\n[mssh] (reverse-i-search)[all-hosts]: ")
 		} else {
-			fmt.Printf("(failed reverse-i-search)`%s': ", searchTerm)
+			fmt.Printf("\n[mssh] (failed reverse-i-search)`%s': ", searchTerm)
 		}
 	} else {
-		matchedCmd := matches[matchIndex]
+		matchedEntry := matches[matchIndex]
 		// 高亮匹配部分
-		highlighted := p.highlightMatch(matchedCmd, searchTerm)
+		highlighted := p.highlightMatch(matchedEntry.Command, searchTerm)
 
-		// 显示格式: (reverse-i-search)`search': matched_command
-		fmt.Printf("(reverse-i-search)`%s': %s", searchTerm, highlighted)
+		// 显示格式: [mssh] (reverse-i-search)`search': [host] command
+		fmt.Printf("\n[mssh] (reverse-i-search)`%s': [%s] %s", searchTerm, matchedEntry.Host, highlighted)
 	}
 }
 
