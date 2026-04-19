@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 )
@@ -83,10 +82,6 @@ func (e *Executor) loadAliases() {
 	}
 	defer file.Close()
 
-	// 解析别名定义: alias name='value' 或 alias name="value"
-	aliasRegex := regexp.MustCompile(`^alias\s+([^=]+)=['"]([^'"]*)['"]`)
-	aliasRegex2 := regexp.MustCompile(`^alias\s+([^=]+)=(\S+)`)
-
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -96,21 +91,99 @@ func (e *Executor) loadAliases() {
 			continue
 		}
 
-		// 尝试匹配 alias name='value' 格式
-		if matches := aliasRegex.FindStringSubmatch(line); len(matches) == 3 {
-			name := strings.TrimSpace(matches[1])
-			value := matches[2]
-			e.aliases[name] = value
-			continue
-		}
-
-		// 尝试匹配 alias name=value 格式（无引号）
-		if matches := aliasRegex2.FindStringSubmatch(line); len(matches) == 3 {
-			name := strings.TrimSpace(matches[1])
-			value := matches[2]
+		// 解析别名 - 使用字符串处理而不是正则，以支持嵌套引号
+		name, value, ok := parseAliasLine(line)
+		if ok {
 			e.aliases[name] = value
 		}
 	}
+}
+
+// parseAliasLine 解析别名行
+// 支持: alias name='value', alias name="value", alias name=value
+// 支持值中包含引号
+func parseAliasLine(line string) (name, value string, ok bool) {
+	// 必须以 alias 开头
+	if !strings.HasPrefix(line, "alias ") && line != "alias" {
+		return "", "", false
+	}
+
+	// 去掉 "alias " 前缀
+	content := strings.TrimPrefix(line, "alias")
+	content = strings.TrimSpace(content)
+
+	// 找到第一个 =
+	eqIdx := strings.Index(content, "=")
+	if eqIdx == -1 {
+		return "", "", false
+	}
+
+	name = strings.TrimSpace(content[:eqIdx])
+	valuePart := strings.TrimSpace(content[eqIdx+1:])
+
+	if name == "" {
+		return "", "", false
+	}
+
+	// 解析值部分
+	if len(valuePart) == 0 {
+		return name, "", true
+	}
+
+	// 检查是否有引号包围
+	if (valuePart[0] == '"' || valuePart[0] == '\'') && len(valuePart) >= 2 {
+		quoteChar := valuePart[0]
+		// 查找匹配的结束引号（考虑转义）
+		endIdx := findClosingQuote(valuePart, quoteChar)
+		if endIdx != -1 {
+			value = valuePart[1:endIdx]
+			// 处理转义字符
+			value = unescapeValue(value, quoteChar)
+			return name, value, true
+		}
+	}
+
+	// 无引号格式，取到行尾或注释
+	if idx := strings.IndexAny(valuePart, "#;"); idx != -1 {
+		valuePart = strings.TrimSpace(valuePart[:idx])
+	}
+	return name, valuePart, true
+}
+
+// findClosingQuote 查找匹配的结束引号位置
+func findClosingQuote(s string, quoteChar byte) int {
+	// 从第二个字符开始查找（跳过开头的引号）
+	for i := 1; i < len(s); i++ {
+		if s[i] == quoteChar {
+			// 检查是否是转义的
+			backslashes := 0
+			for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+				backslashes++
+			}
+			// 如果反斜杠数量是偶数，说明引号没有被转义
+			if backslashes%2 == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// unescapeValue 处理转义字符
+func unescapeValue(value string, quoteChar byte) string {
+	// 单引号内只有 \' 和 \\ 是特殊转义
+	// 双引号内有更多转义序列
+	if quoteChar == '\'' {
+		value = strings.ReplaceAll(value, "\\'", "'")
+		value = strings.ReplaceAll(value, "\\\\", "\\")
+	} else {
+		// 双引号
+		value = strings.ReplaceAll(value, "\\\"", "\"")
+		value = strings.ReplaceAll(value, "\\\\", "\\")
+		value = strings.ReplaceAll(value, "\\n", "\n")
+		value = strings.ReplaceAll(value, "\\t", "\t")
+	}
+	return value
 }
 
 // Execute 执行命令
