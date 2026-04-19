@@ -3,6 +3,7 @@ package history
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,17 +25,36 @@ type RsyncSyncer struct {
 	lastSyncTime   time.Time
 	mu             sync.Mutex
 	rsyncAvailable bool
+	logger         *log.Logger
+	logFile        *os.File
 }
 
 // NewRsyncSyncer 创建rsync同步器
 func NewRsyncSyncer(host *config.Host, localBaseDir string) *RsyncSyncer {
 	localDir := filepath.Join(localBaseDir, host.Name)
+	
+	// 创建日志目录
+	logDir := filepath.Join(localBaseDir, "logs")
+	os.MkdirAll(logDir, 0755)
+	
+	// 打开日志文件
+	logPath := filepath.Join(logDir, fmt.Sprintf("%s_sync.log", host.Name))
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		// 如果无法创建日志文件，使用标准错误输出
+		logFile = os.Stderr
+	}
+	
+	logger := log.New(logFile, "", log.LstdFlags)
+	
 	return &RsyncSyncer{
 		host:           host,
 		localDir:       localDir,
 		interval:       1 * time.Minute, // 默认1分钟
 		stopCh:         make(chan struct{}),
 		rsyncAvailable: checkRsyncAvailable(),
+		logger:         logger,
+		logFile:        logFile,
 	}
 }
 
@@ -58,7 +78,7 @@ func (r *RsyncSyncer) Start() {
 	os.MkdirAll(r.localDir, 0755)
 
 	// 立即执行一次同步
-	fmt.Println("[历史同步] 启动rsync同步服务...")
+	r.logger.Println("[历史同步] 启动rsync同步服务...")
 	r.sync()
 
 	// 启动定期同步goroutine
@@ -72,8 +92,13 @@ func (r *RsyncSyncer) Stop() {
 	r.wg.Wait()
 
 	// 执行最后一次同步
-	fmt.Println("[历史同步] 执行最后一次同步...")
+	r.logger.Println("[历史同步] 执行最后一次同步...")
 	r.sync()
+	
+	// 关闭日志文件
+	if r.logFile != nil && r.logFile != os.Stderr {
+		r.logFile.Close()
+	}
 }
 
 // syncLoop 定期同步循环
@@ -96,7 +121,7 @@ func (r *RsyncSyncer) syncLoop() {
 // sync 执行单次同步
 func (r *RsyncSyncer) sync() {
 	if r.remoteFile == "" {
-		fmt.Println("[历史同步] 未检测到远程历史文件，跳过同步")
+		r.logger.Println("[历史同步] 未检测到远程历史文件，跳过同步")
 		return
 	}
 
@@ -113,11 +138,9 @@ func (r *RsyncSyncer) sync() {
 	}
 
 	if err != nil {
-		fmt.Printf("[历史同步] 同步失败: %v\n", err)
+		r.logger.Printf("[历史同步] 同步失败: %v\n", err)
 	} else {
 		r.lastSyncTime = time.Now()
-		// 不打印每次成功的信息，避免刷屏
-		// fmt.Printf("[历史同步] 已同步到 %s\n", localFile)
 	}
 }
 
@@ -156,7 +179,7 @@ func (r *RsyncSyncer) syncWithRsync(localFile string) error {
 		return fmt.Errorf("rsync失败: %v, 输出: %s", err, string(output))
 	}
 
-	// 检查输出，如果有传输内容才显示
+	// 检查输出，如果有传输内容才记录日志
 	outputStr := string(output)
 	if strings.Contains(outputStr, "bytes/sec") || strings.Contains(outputStr, "speedup") {
 		// 提取传输的文件名
@@ -169,7 +192,7 @@ func (r *RsyncSyncer) syncWithRsync(localFile string) error {
 				!strings.HasPrefix(line, "building") && !strings.Contains(line, "files to consider") {
 				// 可能是文件路径
 				if !strings.HasPrefix(line, "./") && !strings.HasPrefix(line, "/") {
-					fmt.Printf("[历史同步] 已更新: %s\n", filepath.Base(r.remoteFile))
+					r.logger.Printf("[历史同步] 已更新: %s\n", filepath.Base(r.remoteFile))
 					break
 				}
 			}
@@ -202,7 +225,7 @@ func (r *RsyncSyncer) syncWithSCP(localFile string) error {
 		return fmt.Errorf("scp失败: %v, 输出: %s", err, string(output))
 	}
 
-	fmt.Printf("[历史同步] 已同步: %s (使用SCP)\n", filepath.Base(r.remoteFile))
+	r.logger.Printf("[历史同步] 已同步: %s (使用SCP)\n", filepath.Base(r.remoteFile))
 	return nil
 }
 
@@ -251,7 +274,7 @@ func (r *RsyncSyncer) detectRemoteHistoryFile() {
 		}
 	}
 
-	fmt.Printf("[历史同步] 检测到的远程历史文件: %s\n", r.remoteFile)
+	r.logger.Printf("[历史同步] 检测到的远程历史文件: %s\n", r.remoteFile)
 }
 
 // GetLastSyncTime 获取上次同步时间
