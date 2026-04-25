@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
 
 	"mssh/config"
@@ -613,7 +615,8 @@ type agentClient struct {
 }
 
 func (a *agentClient) Signers() ([]ssh.Signer, error) {
-	return nil, fmt.Errorf("not implemented")
+	ag := agent.NewClient(a.conn)
+	return ag.Signers()
 }
 
 func (a *agentClient) Close() error {
@@ -621,5 +624,5 @@ func (a *agentClient) Close() error {
 }
 
 func dialUnix(path string) (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("not implemented")
+	return net.Dial("unix", path)
 }
