@@ -181,7 +181,11 @@ func (c *completer) Do(line []rune, pos int) ([][]rune, int) {
 		for _, group := range c.cfg.GetAllGroupNames() {
 			commands = append(commands, group+":")
 		}
-		return filter(commands, words[len(words)-1]), len(words[len(words)-1])
+				lastWord := ""
+		if len(words) > 0 {
+			lastWord = words[len(words)-1]
+		}
+		return filter(commands, lastWord), len(lastWord)
 	}
 
 	// put/get 命令的文件路径补全
