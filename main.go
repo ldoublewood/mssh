@@ -80,6 +80,25 @@ func main() {
 		executor.SetConcurrent(false)
 	}
 
+	// 单次命令模式: mssh [flags] host: command
+	if args := flag.Args(); len(args) > 0 {
+		cmd := strings.Join(args, " ")
+		rl, err := readline.NewEx(&readline.Config{})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "初始化readline失败: %v\n", err)
+			os.Exit(1)
+		}
+		defer rl.Close()
+		executor.SetReadline(rl)
+		if err := executor.Execute(cmd); err != nil {
+			if err.Error() != "EXIT" {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			}
+			os.Exit(1)
+		}
+		return
+	}
+
 	// 设置自动完成
 	completer := newCompleter(cfg)
 
