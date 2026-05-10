@@ -68,7 +68,9 @@ func main() {
 	// 单次命令模式: mssh [flags] host: command
 	if args := flag.Args(); len(args) > 0 {
 		cmd := strings.Join(args, " ")
-		if !*noKeepalive && *keepalive > 0 {
+
+		// 登录命令（host:）需要交互式 TTY，不能通过 daemon 执行
+		if !isLoginCommand(cmd) && !*noKeepalive && *keepalive > 0 {
 			// 通过 daemon 执行，复用连接
 			resp, err := daemon.SendCommand(*hostsFile, *passwordsFile, cmd, *sequential, *keepalive)
 			if err != nil {
@@ -83,13 +85,19 @@ func main() {
 			}
 			os.Exit(resp.ExitCode)
 		}
-		// 不使用 keepalive，直接执行
+		// 不使用 keepalive（或登录命令），直接执行
 		runOneShot(*hostsFile, *passwordsFile, *sequential, cmd)
 		return
 	}
 
 	// 交互模式
 	runInteractive(*hostsFile, *passwordsFile, *sequential)
+}
+
+// isLoginCommand 判断命令是否是登录命令（host: 格式，需要交互式 TTY）
+func isLoginCommand(cmd string) bool {
+	cmd = strings.TrimSpace(cmd)
+	return strings.HasSuffix(cmd, ":") && !strings.Contains(cmd, " ")
 }
 
 // runOneShot 直接执行单次命令（不使用 daemon）

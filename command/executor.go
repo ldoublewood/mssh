@@ -301,30 +301,29 @@ func (e *Executor) executeLogin(hostName string) error {
 	rsyncer.Start()
 
 	// 进入交互模式
-	oldPrompt := e.rl.Config.Prompt
-	e.rl.Config.Prompt = fmt.Sprintf("[%s] ", hostName)
+	var oldPrompt string
+	if e.rl != nil {
+		oldPrompt = e.rl.Config.Prompt
+		e.rl.Config.Prompt = fmt.Sprintf("[%s] ", hostName)
+	}
 
 	// 启动远程shell
 	err := e.pool.StartShell(host)
 
 	// 停止同步器并执行最后一次同步
-	// 注意：同步错误只记录到日志，不影响退出流程
 	rsyncer.Stop()
 
 	// 恢复提示符
-	e.rl.Config.Prompt = oldPrompt
+	if e.rl != nil {
+		e.rl.Config.Prompt = oldPrompt
+	}
 	e.currentHost = ""
 	e.history.SetHost("")
 
-	// 忽略 StartShell 的退出错误，因为这是用户正常退出 shell
-	// 错误可能包括：exit status 0, exit status 1, connection closed 等
 	if err != nil {
-		// 检查是否是 SSH 退出错误类型
 		if _, ok := err.(*cryptossh.ExitError); ok {
-			// SSH 会话正常退出，忽略错误
 			return nil
 		}
-		// 对于其他错误（如连接关闭），也视为正常退出
 		return nil
 	}
 
