@@ -14,6 +14,7 @@ import (
 	"mssh/command"
 	"mssh/config"
 	"mssh/history"
+	"mssh/internal/daemon"
 	"mssh/ssh"
 )
 
@@ -27,8 +28,25 @@ func main() {
 		hostsFile     = flag.String("c", defaultHostsFile, "主机配置文件路径")
 		passwordsFile = flag.String("p", defaultPasswordsFile, "密码配置文件路径")
 		sequential    = flag.Bool("s", false, "使用顺序模式（默认并发）")
+		asDaemon      = flag.Bool("daemon", false, "以后台daemon模式运行")
+		keepalive     = flag.Duration("keepalive", daemon.DefaultIdleTimeout, "连接保持时长（如 5m, 30s），0s 禁用")
+		noKeepalive   = flag.Bool("no-keepalive", false, "禁用连接保持功能")
 	)
 	flag.Parse()
+
+	// daemon 模式：后台运行，持有连接池，通过 socket 接受命令
+	if *asDaemon {
+		srv, err := daemon.NewServer(*hostsFile, *passwordsFile, *sequential, *keepalive)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "启动daemon失败: %v\n", err)
+			os.Exit(1)
+		}
+		if err := srv.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon运行错误: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// 检查hosts文件
 	if _, err := os.Stat(*hostsFile); err != nil {
@@ -47,22 +65,81 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 加载配置
+	// 单次命令模式: mssh [flags] host: command
+	if args := flag.Args(); len(args) > 0 {
+		cmd := strings.Join(args, " ")
+		if !*noKeepalive && *keepalive > 0 {
+			// 通过 daemon 执行，复用连接
+			resp, err := daemon.SendCommand(*hostsFile, *passwordsFile, cmd, *sequential, *keepalive)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+				os.Exit(1)
+			}
+			if resp.Output != "" {
+				fmt.Print(resp.Output)
+			}
+			if resp.Error != "" {
+				fmt.Fprintf(os.Stderr, "错误: %s\n", resp.Error)
+			}
+			os.Exit(resp.ExitCode)
+		}
+		// 不使用 keepalive，直接执行
+		runOneShot(*hostsFile, *passwordsFile, *sequential, cmd)
+		return
+	}
+
+	// 交互模式
+	runInteractive(*hostsFile, *passwordsFile, *sequential)
+}
+
+// runOneShot 直接执行单次命令（不使用 daemon）
+func runOneShot(hostsFile, passwordsFile string, sequential bool, cmd string) {
 	cfg := config.NewConfig()
-	if err := cfg.LoadHosts(*hostsFile); err != nil {
+	if err := cfg.LoadHosts(hostsFile); err != nil {
 		fmt.Fprintf(os.Stderr, "加载hosts文件失败: %v\n", err)
 		os.Exit(1)
 	}
-
-	// 加载密码（可选）
-	if _, err := os.Stat(*passwordsFile); err == nil {
-		if err := cfg.LoadPasswords(*passwordsFile); err != nil {
-			fmt.Fprintf(os.Stderr, "加载密码文件失败: %v\n", err)
-			os.Exit(1)
-		}
+	if _, err := os.Stat(passwordsFile); err == nil {
+		cfg.LoadPasswords(passwordsFile)
 	}
 
-	// 初始化历史管理器
+	histDir := filepath.Join(os.Getenv("HOME"), ".mssh_history")
+	hist, _ := history.NewManager(histDir)
+	pool := ssh.NewPool()
+	defer pool.Close()
+
+	executor := command.NewExecutor(cfg, pool, hist)
+	if sequential {
+		executor.SetConcurrent(false)
+	}
+
+	rl, err := readline.NewEx(&readline.Config{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "初始化readline失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer rl.Close()
+	executor.SetReadline(rl)
+
+	if err := executor.Execute(cmd); err != nil {
+		if err.Error() != "EXIT" {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		}
+		os.Exit(1)
+	}
+}
+
+// runInteractive 启动交互式 REPL
+func runInteractive(hostsFile, passwordsFile string, sequential bool) {
+	cfg := config.NewConfig()
+	if err := cfg.LoadHosts(hostsFile); err != nil {
+		fmt.Fprintf(os.Stderr, "加载hosts文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := os.Stat(passwordsFile); err == nil {
+		cfg.LoadPasswords(passwordsFile)
+	}
+
 	histDir := filepath.Join(os.Getenv("HOME"), ".mssh_history")
 	hist, err := history.NewManager(histDir)
 	if err != nil {
@@ -70,39 +147,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 初始化SSH连接池
 	pool := ssh.NewPool()
 	defer pool.Close()
 
-	// 初始化命令执行器
 	executor := command.NewExecutor(cfg, pool, hist)
-	if *sequential {
+	if sequential {
 		executor.SetConcurrent(false)
 	}
 
-	// 单次命令模式: mssh [flags] host: command
-	if args := flag.Args(); len(args) > 0 {
-		cmd := strings.Join(args, " ")
-		rl, err := readline.NewEx(&readline.Config{})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "初始化readline失败: %v\n", err)
-			os.Exit(1)
-		}
-		defer rl.Close()
-		executor.SetReadline(rl)
-		if err := executor.Execute(cmd); err != nil {
-			if err.Error() != "EXIT" {
-				fmt.Fprintf(os.Stderr, "错误: %v\n", err)
-			}
-			os.Exit(1)
-		}
-		return
-	}
-
-	// 设置自动完成
 	completer := newCompleter(cfg)
 
-	// 初始化readline
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:            executor.GetPrompt(),
 		HistoryFile:       filepath.Join(histDir, "local_history.txt"),
@@ -119,7 +173,6 @@ func main() {
 
 	executor.SetReadline(rl)
 
-	// 加载历史
 	hist.SetHost("")
 	if commands, err := hist.LoadHistory(); err == nil {
 		for _, cmd := range commands {
@@ -127,7 +180,6 @@ func main() {
 		}
 	}
 
-	// 设置信号处理
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -137,7 +189,6 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// 欢迎信息
 	fmt.Println("多机SSH客户端 (mssh)")
 	fmt.Printf("已加载 %d 个主机, %d 个组\n", len(cfg.Hosts), len(cfg.Groups))
 	if executor.IsConcurrent() {
@@ -148,9 +199,7 @@ func main() {
 	fmt.Println("输入 'help' 查看帮助")
 	fmt.Println()
 
-	// 主循环
 	for {
-		// 更新提示符
 		rl.SetPrompt(executor.GetPrompt())
 
 		line, err := rl.Readline()
