@@ -15,6 +15,7 @@ import (
 	"mssh/config"
 	"mssh/history"
 	"mssh/internal/daemon"
+	"mssh/mcp"
 	"mssh/ssh"
 )
 
@@ -29,6 +30,7 @@ func main() {
 		passwordsFile = flag.String("p", defaultPasswordsFile, "密码配置文件路径")
 		sequential    = flag.Bool("s", false, "使用顺序模式（默认并发）")
 		asDaemon      = flag.Bool("daemon", false, "以后台daemon模式运行")
+		asMCP         = flag.Bool("mcp", false, "以MCP服务器模式运行（stdio通信）")
 		keepalive     = flag.Duration("keepalive", daemon.DefaultIdleTimeout, "连接保持时长（如 5m, 30s），0s 禁用")
 		noKeepalive   = flag.Bool("no-keepalive", false, "禁用连接保持功能")
 	)
@@ -45,6 +47,12 @@ func main() {
 			fmt.Fprintf(os.Stderr, "daemon运行错误: %v\n", err)
 			os.Exit(1)
 		}
+		return
+	}
+
+	// MCP 模式：通过 stdio 提供 MCP 服务，供 Claude Code 等客户端调用
+	if *asMCP {
+		runMCP(*hostsFile, *passwordsFile)
 		return
 	}
 
@@ -98,6 +106,27 @@ func main() {
 func isLoginCommand(cmd string) bool {
 	cmd = strings.TrimSpace(cmd)
 	return strings.HasSuffix(cmd, ":") && !strings.Contains(cmd, " ")
+}
+
+// runMCP 启动 MCP Server 模式，通过 stdio 与客户端通信
+func runMCP(hostsFile, passwordsFile string) {
+	cfg := config.NewConfig()
+	if err := cfg.LoadHosts(hostsFile); err != nil {
+		fmt.Fprintf(os.Stderr, "加载hosts文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := os.Stat(passwordsFile); err == nil {
+		cfg.LoadPasswords(passwordsFile)
+	}
+
+	pool := ssh.NewPool()
+	defer pool.Close()
+
+	server := mcp.NewServer(cfg, pool)
+	if err := server.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "MCP服务器错误: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // runOneShot 直接执行单次命令（不使用 daemon）
