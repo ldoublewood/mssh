@@ -20,14 +20,15 @@ import (
 )
 
 const (
-	defaultHostsFile     = "hosts.ini"
-	defaultPasswordsFile = "passwords.ini"
+	msshDir           = ".mssh"
+	hostsFileName     = "hosts.ini"
+	passwordsFileName = "passwords.ini"
 )
 
 func main() {
 	var (
-		hostsFile     = flag.String("c", defaultHostsFile, "主机配置文件路径")
-		passwordsFile = flag.String("p", defaultPasswordsFile, "密码配置文件路径")
+		hostsFile     = flag.String("c", "", "主机配置文件路径")
+		passwordsFile = flag.String("p", "", "密码配置文件路径")
 		sequential    = flag.Bool("s", false, "使用顺序模式（默认并发）")
 		asDaemon      = flag.Bool("daemon", false, "以后台daemon模式运行")
 		asMCP         = flag.Bool("mcp", false, "以MCP服务器模式运行（stdio通信）")
@@ -35,6 +36,33 @@ func main() {
 		noKeepalive   = flag.Bool("no-keepalive", false, "禁用连接保持功能")
 	)
 	flag.Parse()
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = os.Getenv("HOME")
+	}
+
+	if *hostsFile == "" {
+		cwd, _ := os.Getwd()
+		localPath := filepath.Join(cwd, msshDir, hostsFileName)
+		homePath := filepath.Join(homeDir, msshDir, hostsFileName)
+		if _, err := os.Stat(localPath); err == nil {
+			*hostsFile = localPath
+		} else {
+			*hostsFile = homePath
+		}
+	}
+
+	if *passwordsFile == "" {
+		cwd, _ := os.Getwd()
+		localPath := filepath.Join(cwd, msshDir, passwordsFileName)
+		homePath := filepath.Join(homeDir, msshDir, passwordsFileName)
+		if _, err := os.Stat(localPath); err == nil {
+			*passwordsFile = localPath
+		} else {
+			*passwordsFile = homePath
+		}
+	}
 
 	// daemon 模式：后台运行，持有连接池，通过 socket 接受命令
 	if *asDaemon {
@@ -69,7 +97,8 @@ func main() {
 		fmt.Println("\n  2. 可选创建 passwords.ini 文件（免密登录可跳过）:")
 		fmt.Println("     web1 = password123")
 		fmt.Println("     web2 = password456")
-		fmt.Println("\n  3. 运行: mssh -c hosts.ini")
+		fmt.Println("\n  3. 放置到 .mssh/hosts.ini（当前目录或 ~ 目录均可）")
+		fmt.Println("  4. 运行: mssh")
 		os.Exit(1)
 	}
 
