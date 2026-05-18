@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,8 +26,11 @@ type Executor struct {
 	transfer    *transfer.TransferManager
 	localShell  *shell.Executor
 	rl          *readline.Instance
+	stdout      io.Writer
+	stderr      io.Writer
 	concurrent  bool
 	currentHost string // 当前登录的主机（用于交互模式）
+	mu          sync.Mutex
 }
 
 // NewExecutor 创建命令执行器
@@ -37,8 +41,33 @@ func NewExecutor(cfg *config.Config, pool *ssh.Pool, hist *history.Manager) *Exe
 		history:    hist,
 		transfer:   transfer.NewTransferManager(pool),
 		localShell: shell.NewExecutor(),
+		stdout:     os.Stdout,
+		stderr:     os.Stderr,
 		concurrent: true,
 	}
+}
+
+// ExecuteTo 使用指定的 io.Writer 执行命令（goroutine 安全）
+func (e *Executor) ExecuteTo(cmd string, stdout, stderr io.Writer) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	oldOut := e.stdout
+	oldErr := e.stderr
+	e.stdout = stdout
+	e.stderr = stderr
+	if e.localShell != nil {
+		e.localShell.SetOutput(stdout, stderr)
+	}
+	defer func() {
+		e.stdout = oldOut
+		e.stderr = oldErr
+		if e.localShell != nil {
+			e.localShell.SetOutput(oldOut, oldErr)
+		}
+	}()
+
+	return e.Execute(cmd)
 }
 
 // SetReadline 设置readline实例
@@ -124,10 +153,10 @@ func (e *Executor) executeBuiltIn(input string) error {
 		return fmt.Errorf("EXIT")
 	case "concurrent":
 		e.concurrent = true
-		fmt.Println("已切换到并发模式")
+		fmt.Fprintln(e.stdout, "已切换到并发模式")
 	case "sequential":
 		e.concurrent = false
-		fmt.Println("已切换到顺序模式")
+		fmt.Fprintln(e.stdout, "已切换到顺序模式")
 	}
 	return nil
 }
@@ -234,12 +263,12 @@ func (e *Executor) executeRemoteCommand(hostOrGroup, command string) error {
 	if len(hosts) == 1 || !e.concurrent {
 		// 顺序执行
 		for _, host := range hosts {
-			fmt.Printf("\n=== [%s] %s ===\n", host.Name, command)
+			fmt.Fprintf(e.stdout, "\n=== [%s] %s ===\n", host.Name, command)
 			output, err := e.pool.ExecuteWithOutput(host, command)
 			if err != nil {
-				fmt.Printf("错误: %v\n", err)
+				fmt.Fprintf(e.stderr, "错误: %v\n", err)
 			} else {
-				fmt.Print(output)
+				fmt.Fprint(e.stdout, output)
 			}
 		}
 	} else {
@@ -269,12 +298,12 @@ func (e *Executor) executeRemoteCommand(hostOrGroup, command string) error {
 
 		// 统一输出结果
 		for _, host := range hosts {
-			fmt.Printf("\n=== [%s] %s ===\n", host.Name, command)
+			fmt.Fprintf(e.stdout, "\n=== [%s] %s ===\n", host.Name, command)
 			result := results[host.Name]
 			if result.err != nil {
-				fmt.Printf("错误: %v\n", result.err)
+				fmt.Fprintf(e.stderr, "错误: %v\n", result.err)
 			} else {
-				fmt.Print(result.output)
+				fmt.Fprint(e.stdout, result.output)
 			}
 		}
 	}
@@ -289,7 +318,7 @@ func (e *Executor) executeLogin(hostName string) error {
 		return fmt.Errorf("主机 '%s' 不存在", hostName)
 	}
 
-	fmt.Printf("正在登录 %s (%s@%s:%d)...\n", host.Name, host.User, host.IP, host.Port)
+	fmt.Fprintf(e.stdout, "正在登录 %s (%s@%s:%d)...\n", host.Name, host.User, host.IP, host.Port)
 
 	e.currentHost = hostName
 	e.history.SetHost(hostName)
@@ -350,14 +379,14 @@ func (e *Executor) executeTransfer(direction, hostOrGroup, localPath, remotePath
 		if _, err := os.Stat(localPath); err != nil {
 			return fmt.Errorf("本地文件不存在: %s", localPath)
 		}
-		fmt.Printf("上传 %s 到 %d 台主机...\n", localPath, len(hosts))
+		fmt.Fprintf(e.stdout, "上传 %s 到 %d 台主机...\n", localPath, len(hosts))
 		return e.transfer.Upload(hosts, localPath, remotePath, e.concurrent)
 	} else {
 		// 从远程下载（仅支持单台）
 		if len(hosts) > 1 {
 			return fmt.Errorf("下载操作仅支持单台主机，请指定具体主机而非组")
 		}
-		fmt.Printf("从 %s 下载 %s 到 %s...\n", hosts[0].Name, remotePath, localPath)
+		fmt.Fprintf(e.stdout, "从 %s 下载 %s 到 %s...\n", hosts[0].Name, remotePath, localPath)
 		return e.transfer.Download(hosts[0], remotePath, localPath)
 	}
 }
@@ -399,24 +428,24 @@ func (e *Executor) showHelp() {
   hosts.ini  - 主机配置 (用户名@IP:端口)
   passwords.ini - 密码配置（可选，支持免密登录时不需要）
 `
-	fmt.Println(help)
+	fmt.Fprintln(e.stdout, help)
 }
 
 // listHosts 列出所有主机
 func (e *Executor) listHosts() {
-	fmt.Println("主机列表:")
+	fmt.Fprintln(e.stdout, "主机列表:")
 	for _, name := range e.config.GetAllHostNames() {
 		host, _ := e.config.GetHost(name)
-		fmt.Printf("  %s -> %s@%s:%d\n", name, host.User, host.IP, host.Port)
+		fmt.Fprintf(e.stdout, "  %s -> %s@%s:%d\n", name, host.User, host.IP, host.Port)
 	}
 }
 
 // listGroups 列出所有组
 func (e *Executor) listGroups() {
-	fmt.Println("主机组列表:")
+	fmt.Fprintln(e.stdout, "主机组列表:")
 	for _, name := range e.config.GetAllGroupNames() {
 		group, _ := e.config.GetGroup(name)
-		fmt.Printf("  %s: hosts=%v\n", name, group.Hosts)
+		fmt.Fprintf(e.stdout, "  %s: hosts=%v\n", name, group.Hosts)
 	}
 }
 

@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"mssh/command"
@@ -26,6 +27,7 @@ type Server struct {
 	idleTimeout time.Duration
 	hostsFile   string
 	passFile    string
+	lockFile    *os.File
 
 	mu         sync.Mutex
 	listener   net.Listener
@@ -58,6 +60,20 @@ func NewServer(hostsFile, passwordsFile string, sequential bool, idleTimeout tim
 		executor.SetConcurrent(false)
 	}
 
+	// 获取 PID 文件上的排他锁，防止多个 daemon 同时运行
+	pidPath := PidPath()
+	os.MkdirAll(filepath.Dir(pidPath), 0700)
+	lockFile, err := os.OpenFile(pidPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("打开PID文件失败: %v", err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lockFile.Close()
+		pool.Close()
+		return nil, fmt.Errorf("另一个daemon已在运行")
+	}
+
 	return &Server{
 		cfg:         cfg,
 		pool:        pool,
@@ -66,6 +82,7 @@ func NewServer(hostsFile, passwordsFile string, sequential bool, idleTimeout tim
 		idleTimeout: idleTimeout,
 		hostsFile:   hostsFile,
 		passFile:    passwordsFile,
+		lockFile:    lockFile,
 		stopCh:      make(chan struct{}),
 	}, nil
 }
@@ -82,10 +99,10 @@ func (s *Server) Run() error {
 	defer os.Remove(s.socketPath)
 	defer s.listener.Close()
 
-	pidFile := PidPath()
 	pidData := fmt.Appendf(nil, "%d\n%s\n%s", os.Getpid(), s.hostsFile, s.passFile)
-	os.WriteFile(pidFile, pidData, 0600)
-	defer os.Remove(pidFile)
+	s.lockFile.Truncate(0)
+	s.lockFile.Seek(0, 0)
+	s.lockFile.Write(pidData)
 
 	s.lastActive = time.Now()
 	go s.idleChecker()
@@ -145,39 +162,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	json.NewEncoder(conn).Encode(&resp)
 }
 
-// executeCaptured 执行命令并捕获 stdout/stderr 输出
+// executeCaptured 执行命令并捕获 stdout/stderr 输出，每个连接独立 buffer 无竞态
 func (s *Server) executeCaptured(cmd string) (string, error) {
-	rOut, wOut, _ := os.Pipe()
-	rErr, wErr, _ := os.Pipe()
-
-	oldStdout := os.Stdout
-	oldStderr := os.Stderr
-	os.Stdout = wOut
-	os.Stderr = wErr
-
-	var execErr error
-	var wg sync.WaitGroup
-	wg.Add(2)
-
 	var outBuf, errBuf bytes.Buffer
-
-	go func() {
-		defer wg.Done()
-		io.Copy(&outBuf, rOut)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(&errBuf, rErr)
-	}()
-
-	execErr = s.executor.Execute(cmd)
-
-	wOut.Close()
-	wErr.Close()
-	wg.Wait()
-
-	os.Stdout = oldStdout
-	os.Stderr = oldStderr
+	execErr := s.executor.ExecuteTo(cmd, &outBuf, &errBuf)
 
 	output := outBuf.String()
 	if errBuf.Len() > 0 {
@@ -223,6 +211,9 @@ func (s *Server) Stop() {
 		s.listener.Close()
 	}
 	s.pool.Close()
+	if s.lockFile != nil {
+		s.lockFile.Close()
+	}
 }
 
 // CheckConfig 检查 daemon 的配置是否与请求匹配

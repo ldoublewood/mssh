@@ -3,6 +3,7 @@ package shell
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -21,6 +22,8 @@ type Executor struct {
 	homeDir    string
 	username   string
 	hostname   string
+	stdout     io.Writer
+	stderr     io.Writer
 	mu         sync.Mutex
 }
 
@@ -54,12 +57,20 @@ func NewExecutor() *Executor {
 		homeDir:    homeDir,
 		username:   username,
 		hostname:   hostname,
+		stdout:     os.Stdout,
+		stderr:     os.Stderr,
 	}
 
 	// 加载用户别名
 	e.loadAliases()
 
 	return e
+}
+
+// SetOutput 设置输出写入目标
+func (e *Executor) SetOutput(stdout, stderr io.Writer) {
+	e.stdout = stdout
+	e.stderr = stderr
 }
 
 // loadAliases 从用户的shell配置文件中加载别名
@@ -286,8 +297,8 @@ func (e *Executor) executeWithShell(command string) error {
 	cmd.Dir = currentDir
 	cmd.Env = os.Environ()
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = e.stdout
+	cmd.Stderr = e.stderr
 
 	return cmd.Run()
 }
@@ -333,7 +344,7 @@ func (e *Executor) handleCd(args []string) error {
 func (e *Executor) handlePwd() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	fmt.Println(e.currentDir)
+	fmt.Fprintln(e.stdout, e.currentDir)
 	return nil
 }
 
@@ -345,7 +356,7 @@ func (e *Executor) handleExport(args []string) error {
 	if len(args) == 0 {
 		// 显示所有环境变量
 		for k, v := range e.envVars {
-			fmt.Printf("declare -x %s=\"%s\"\n", k, v)
+		fmt.Fprintf(e.stdout, "declare -x %s=\"%s\"\n", k, v)
 		}
 		return nil
 	}
@@ -380,7 +391,7 @@ func (e *Executor) handleUnset(args []string) error {
 // handleEnv 处理env命令
 func (e *Executor) handleEnv() error {
 	for _, env := range os.Environ() {
-		fmt.Println(env)
+		fmt.Fprintln(e.stdout, env)
 	}
 	return nil
 }
@@ -393,12 +404,12 @@ func (e *Executor) handleAlias(args []string) error {
 	if len(args) == 0 {
 		// 显示所有已加载的别名
 		if len(e.aliases) == 0 {
-			fmt.Println("没有加载到别名")
+		fmt.Fprintln(e.stdout, "没有加载到别名")
 			return nil
 		}
-		fmt.Println("已加载的别名:")
+		fmt.Fprintln(e.stdout, "已加载的别名:")
 		for name, value := range e.aliases {
-			fmt.Printf("  %s='%s'\n", name, value)
+			fmt.Fprintf(e.stdout, "  %s='%s'\n", name, value)
 		}
 		return nil
 	}
@@ -414,9 +425,9 @@ func (e *Executor) handleAlias(args []string) error {
 		} else {
 			// 查询别名
 			if value, ok := e.aliases[name]; ok {
-				fmt.Printf("%s='%s'\n", name, value)
+				fmt.Fprintf(e.stdout, "%s='%s'\n", name, value)
 			} else {
-				fmt.Printf("alias: %s: 未找到\n", name)
+				fmt.Fprintf(e.stdout, "alias: %s: 未找到\n", name)
 			}
 		}
 	}
