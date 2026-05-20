@@ -265,10 +265,11 @@ func (e *Executor) executeRemoteCommand(hostOrGroup, command string) error {
 		for _, host := range hosts {
 			fmt.Fprintf(e.stdout, "\n=== [%s] %s ===\n", host.Name, command)
 			output, err := e.pool.ExecuteWithOutput(host, command)
-			if err != nil {
-				fmt.Fprintf(e.stderr, "错误: %v\n", err)
-			} else {
+			if output != "" {
 				fmt.Fprint(e.stdout, output)
+			}
+			if err != nil {
+				fmt.Fprintf(e.stderr, "\n错误: %v\n", err)
 			}
 		}
 	} else {
@@ -300,10 +301,11 @@ func (e *Executor) executeRemoteCommand(hostOrGroup, command string) error {
 		for _, host := range hosts {
 			fmt.Fprintf(e.stdout, "\n=== [%s] %s ===\n", host.Name, command)
 			result := results[host.Name]
-			if result.err != nil {
-				fmt.Fprintf(e.stderr, "错误: %v\n", result.err)
-			} else {
+			if result.output != "" {
 				fmt.Fprint(e.stdout, result.output)
+			}
+			if result.err != nil {
+				fmt.Fprintf(e.stderr, "\n错误: %v\n", result.err)
 			}
 		}
 	}
