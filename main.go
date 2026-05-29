@@ -169,7 +169,7 @@ func runOneShot(hostsFile, passwordsFile string, sequential bool, cmd string) {
 		cfg.LoadPasswords(passwordsFile)
 	}
 
-	histDir := filepath.Join(os.Getenv("HOME"), ".mssh_history")
+	histDir := filepath.Join(os.Getenv("HOME"), ".mssh")
 	hist, _ := history.NewManager(histDir)
 	pool := ssh.NewPool()
 	defer pool.Close()
@@ -206,7 +206,7 @@ func runInteractive(hostsFile, passwordsFile string, sequential bool) {
 		cfg.LoadPasswords(passwordsFile)
 	}
 
-	histDir := filepath.Join(os.Getenv("HOME"), ".mssh_history")
+	histDir := filepath.Join(os.Getenv("HOME"), ".mssh")
 	hist, err := history.NewManager(histDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "初始化历史管理器失败: %v\n", err)

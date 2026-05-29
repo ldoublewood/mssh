@@ -48,7 +48,7 @@ func NewServer(hostsFile, passwordsFile string, sequential bool, idleTimeout tim
 	}
 
 	pool := ssh.NewPool()
-	histDir := os.Getenv("HOME") + "/.mssh_history"
+	histDir := os.Getenv("HOME") + "/.mssh"
 	hist, err := history.NewManager(histDir)
 	if err != nil {
 		pool.Close()

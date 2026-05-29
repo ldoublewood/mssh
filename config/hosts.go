@@ -39,7 +39,14 @@ func NewConfig() *Config {
 	}
 }
 
-// LoadHosts 从hosts.ini文件加载主机配置
+// pendingGroupEntry 表示组内待解析的条目（裸名，第二遍处理）
+type pendingGroupEntry struct {
+	groupName string
+	lineNum   int
+	name      string
+}
+
+// LoadHosts 从hosts.ini文件加载主机配置（两遍解析）
 func (c *Config) LoadHosts(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -47,8 +54,10 @@ func (c *Config) LoadHosts(filename string) error {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	var pendingBareNames []pendingGroupEntry
 	var currentGroup string
+
+	scanner := bufio.NewScanner(file)
 	lineNum := 0
 
 	for scanner.Scan() {
@@ -77,30 +86,45 @@ func (c *Config) LoadHosts(filename string) error {
 			continue
 		}
 
-		// 解析主机定义: name = user@ip:port
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			return fmt.Errorf("第%d行: 格式错误，应为 'name = user@ip:port'", lineNum)
-		}
+		// 包含 '=' 的行是地址定义
+		if strings.Contains(line, "=") {
+			parts := strings.SplitN(line, "=", 2)
+			hostName := strings.TrimSpace(parts[0])
+			addrStr := strings.TrimSpace(parts[1])
 
-		hostName := strings.TrimSpace(parts[0])
-		addrStr := strings.TrimSpace(parts[1])
+			if hostName == "" {
+				return fmt.Errorf("第%d行: 主机名不能为空", lineNum)
+			}
 
-		if hostName == "" {
-			return fmt.Errorf("第%d行: 主机名不能为空", lineNum)
-		}
+			// 检查重复的地址定义
+			if _, exists := c.Hosts[hostName]; exists {
+				return fmt.Errorf("第%d行: 主机 '%s' 的地址信息重复定义，地址信息只能出现一次", lineNum, hostName)
+			}
 
-		host, err := parseHostAddr(hostName, addrStr)
-		if err != nil {
-			return fmt.Errorf("第%d行: %v", lineNum, err)
-		}
+			host, err := parseHostAddr(hostName, addrStr)
+			if err != nil {
+				return fmt.Errorf("第%d行: %v", lineNum, err)
+			}
 
-		c.Hosts[hostName] = host
+			c.Hosts[hostName] = host
 
-		// 如果有当前组，将主机添加到组中
-		if currentGroup != "" {
-			group := c.Groups[currentGroup]
-			group.Hosts = append(group.Hosts, hostName)
+			if currentGroup != "" {
+				group := c.Groups[currentGroup]
+				group.Hosts = append(group.Hosts, hostName)
+			}
+		} else {
+			// 裸名（无 '=' 的行）—— 留到第二遍解析
+			bareName := strings.TrimSpace(line)
+			if bareName != "" {
+				if currentGroup == "" {
+					return fmt.Errorf("第%d行: '%s' 不在任何组内，裸名必须出现在组定义中", lineNum, bareName)
+				}
+				pendingBareNames = append(pendingBareNames, pendingGroupEntry{
+					groupName: currentGroup,
+					lineNum:   lineNum,
+					name:      bareName,
+				})
+			}
 		}
 	}
 
@@ -108,12 +132,31 @@ func (c *Config) LoadHosts(filename string) error {
 		return fmt.Errorf("读取hosts文件失败: %v", err)
 	}
 
+	// 第二遍：解析裸名 —— 指向同名主机或子组
+	for _, entry := range pendingBareNames {
+		if _, isHost := c.Hosts[entry.name]; isHost {
+			group := c.Groups[entry.groupName]
+			group.Hosts = append(group.Hosts, entry.name)
+		} else if _, isGroup := c.Groups[entry.name]; isGroup {
+			group := c.Groups[entry.groupName]
+			group.SubGroups = append(group.SubGroups, entry.name)
+		} else {
+			return fmt.Errorf("第%d行: '%s' 不是已知的主机或组名", entry.lineNum, entry.name)
+		}
+	}
+
+	// 验证：每个组必须有至少一个成员
+	for _, group := range c.Groups {
+		if len(group.Hosts) == 0 && len(group.SubGroups) == 0 {
+			return fmt.Errorf("组 '%s' 没有任何主机或子组，组必须至少包含一个成员", group.Name)
+		}
+	}
+
 	return nil
 }
 
 // parseHostAddr 解析地址字符串 user@ip:port
 func parseHostAddr(name, addr string) (*Host, error) {
-	// 正则匹配 user@ip:port 或 user@ip
 	re := regexp.MustCompile(`^([^@]+)@([^:]+)(?::(\d+))?$`)
 	matches := re.FindStringSubmatch(addr)
 
@@ -123,7 +166,7 @@ func parseHostAddr(name, addr string) (*Host, error) {
 
 	user := matches[1]
 	ip := matches[2]
-	port := 22 // 默认端口
+	port := 22
 
 	if matches[3] != "" {
 		p, err := strconv.Atoi(matches[3])
@@ -146,7 +189,6 @@ func (c *Config) LoadPasswords(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 密码文件不存在是正常的（使用免密登录）
 			return nil
 		}
 		return fmt.Errorf("无法打开密码文件 %s: %v", filename, err)
@@ -160,15 +202,13 @@ func (c *Config) LoadPasswords(filename string) error {
 		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 
-		// 跳过空行和注释
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 
-		// 解析: host = password
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			continue // 跳过格式错误的行
+			continue
 		}
 
 		hostName := strings.TrimSpace(parts[0])
@@ -194,7 +234,7 @@ func (c *Config) GetGroup(name string) (*Group, bool) {
 	return group, exists
 }
 
-// GetHostsByGroup 递归获取组内的所有主机（展开子组）
+// GetHostsByGroup 递归获取组内的所有主机（展开子组，带环检测）
 func (c *Config) GetHostsByGroup(groupName string) ([]*Host, error) {
 	group, exists := c.Groups[groupName]
 	if !exists {
@@ -202,7 +242,8 @@ func (c *Config) GetHostsByGroup(groupName string) ([]*Host, error) {
 	}
 
 	hostMap := make(map[string]*Host)
-	c.collectHostsRecursive(group, hostMap)
+	visited := make(map[string]bool)
+	c.collectHostsRecursive(group, hostMap, visited)
 
 	hosts := make([]*Host, 0, len(hostMap))
 	for _, host := range hostMap {
@@ -211,19 +252,22 @@ func (c *Config) GetHostsByGroup(groupName string) ([]*Host, error) {
 	return hosts, nil
 }
 
-// collectHostsRecursive 递归收集组内的所有主机
-func (c *Config) collectHostsRecursive(group *Group, hostMap map[string]*Host) {
-	// 添加直接的主机
+// collectHostsRecursive 递归收集组内的所有主机（带环检测）
+func (c *Config) collectHostsRecursive(group *Group, hostMap map[string]*Host, visited map[string]bool) {
+	if visited[group.Name] {
+		return
+	}
+	visited[group.Name] = true
+
 	for _, hostName := range group.Hosts {
 		if host, exists := c.Hosts[hostName]; exists {
 			hostMap[hostName] = host
 		}
 	}
 
-	// 递归处理子组
 	for _, subGroupName := range group.SubGroups {
 		if subGroup, exists := c.Groups[subGroupName]; exists {
-			c.collectHostsRecursive(subGroup, hostMap)
+			c.collectHostsRecursive(subGroup, hostMap, visited)
 		}
 	}
 }

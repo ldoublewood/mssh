@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 // Manager 管理历史命令
@@ -24,10 +26,9 @@ func NewManager(baseDir string) (*Manager, error) {
 		if err != nil {
 			return nil, fmt.Errorf("获取用户目录失败: %v", err)
 		}
-		baseDir = filepath.Join(home, ".cmd_history")
+		baseDir = filepath.Join(home, ".mssh")
 	}
 
-	// 创建基础目录
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return nil, fmt.Errorf("创建历史目录失败: %v", err)
 	}
@@ -37,14 +38,14 @@ func NewManager(baseDir string) (*Manager, error) {
 	}, nil
 }
 
-// SetHost 设置当前主机
-func (m *Manager) SetHost(host string) {
+// SetHostID 设置当前主机的 host_id，创建对应的 history 目录
+func (m *Manager) SetHostID(hostID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.currentHost = host
-	if host != "" {
-		hostDir := filepath.Join(m.baseDir, host)
+	m.currentHost = hostID
+	if hostID != "" {
+		hostDir := filepath.Join(m.baseDir, hostID, "history")
 		os.MkdirAll(hostDir, 0755)
 		m.historyFile = filepath.Join(hostDir, "history.txt")
 	} else {
@@ -52,7 +53,12 @@ func (m *Manager) SetHost(host string) {
 	}
 }
 
-// SaveCommand 保存命令到历史
+// SetHost 兼容旧接口，使用 host 名作为 host_id
+func (m *Manager) SetHost(host string) {
+	m.SetHostID(host)
+}
+
+// SaveCommand 保存命令到历史（带文件锁防并发）
 func (m *Manager) SaveCommand(command string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -61,44 +67,33 @@ func (m *Manager) SaveCommand(command string) error {
 		m.historyFile = filepath.Join(m.baseDir, "local_history.txt")
 	}
 
-	// 不保存空命令和重复命令
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return nil
 	}
 
-	// 检查是否与最后一条重复
-	if lastCmd, _ := m.getLastCommand(); lastCmd == command {
-		return nil
-	}
-
-	file, err := os.OpenFile(m.historyFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(m.historyFile, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return fmt.Errorf("打开历史文件失败: %v", err)
 	}
-	defer file.Close()
+	defer f.Close()
 
-	_, err = fmt.Fprintln(file, command)
+	// 获取排他锁
+	if err := lockFileWithTimeout(f, 2*time.Second); err != nil {
+		return fmt.Errorf("获取文件锁失败: %v", err)
+	}
+	defer unlockFile(f)
+
+	// 检查是否与最后一条重复
+	if lastCmd, _ := readLastLine(f); lastCmd == command {
+		return nil
+	}
+
+	_, err = fmt.Fprintln(f, command)
 	return err
 }
 
-// getLastCommand 获取最后一条命令
-func (m *Manager) getLastCommand() (string, error) {
-	file, err := os.Open(m.historyFile)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	var lastLine string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lastLine = scanner.Text()
-	}
-	return lastLine, scanner.Err()
-}
-
-// LoadHistory 加载历史命令，返回历史命令列表
+// LoadHistory 加载历史命令（带共享锁）
 func (m *Manager) LoadHistory() ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -107,17 +102,22 @@ func (m *Manager) LoadHistory() ([]string, error) {
 		return nil, nil
 	}
 
-	file, err := os.Open(m.historyFile)
+	f, err := os.Open(m.historyFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	defer file.Close()
+	defer f.Close()
+
+	if err := lockFileWithTimeout(f, 2*time.Second); err != nil {
+		return nil, fmt.Errorf("获取文件锁失败: %v", err)
+	}
+	defer unlockFile(f)
 
 	var commands []string
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		cmd := strings.TrimSpace(scanner.Text())
 		if cmd != "" {
@@ -125,6 +125,16 @@ func (m *Manager) LoadHistory() ([]string, error) {
 		}
 	}
 	return commands, scanner.Err()
+}
+
+// readLastLine 读取文件的最后一行（调用者需持有锁）
+func readLastLine(f *os.File) (string, error) {
+	var lastLine string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lastLine = scanner.Text()
+	}
+	return lastLine, scanner.Err()
 }
 
 // GetHistoryFile 获取当前历史文件路径
@@ -136,7 +146,7 @@ func (m *Manager) GetHistoryFile() string {
 
 // GetHostHistoryDir 获取指定主机的历史目录
 func (m *Manager) GetHostHistoryDir(host string) string {
-	return filepath.Join(m.baseDir, host)
+	return filepath.Join(m.baseDir, host, "history")
 }
 
 // GetBaseDir 获取历史基础目录
@@ -144,16 +154,13 @@ func (m *Manager) GetBaseDir() string {
 	return m.baseDir
 }
 
-// SyncFromRemote 从远程同步历史命令（通过rsync）
+// SyncFromRemote 从远程同步历史命令
 func (m *Manager) SyncFromRemote(host string, sshConn interface{}) error {
-	// 实际实现需要在transfer模块中调用rsync
-	// 这里提供接口定义
 	return fmt.Errorf("not implemented: use transfer.RsyncHistory instead")
 }
 
 // SyncToRemote 同步历史命令到远程
 func (m *Manager) SyncToRemote(host string, sshConn interface{}) error {
-	// 实际实现需要在transfer模块中调用rsync
 	return fmt.Errorf("not implemented: use transfer.RsyncHistory instead")
 }
 
@@ -183,4 +190,24 @@ func (m *Manager) ClearHistory() error {
 	}
 
 	return os.Remove(m.historyFile)
+}
+
+// lockFileWithTimeout 带超时的非阻塞文件锁
+func lockFileWithTimeout(f *os.File, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("等待文件锁超时")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// unlockFile 释放文件锁
+func unlockFile(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }

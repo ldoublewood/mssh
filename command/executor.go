@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -322,13 +321,18 @@ func (e *Executor) executeLogin(hostName string) error {
 
 	fmt.Fprintf(e.stdout, "正在登录 %s (%s@%s:%d)...\n", host.Name, host.User, host.IP, host.Port)
 
+	// 获取 client 以取得 hostID
+	client, clientErr := e.pool.GetClient(host)
+	if clientErr != nil {
+		return fmt.Errorf("连接失败: %v", clientErr)
+	}
+	hostID := client.GetHostID()
+
 	e.currentHost = hostName
-	e.history.SetHost(hostName)
+	e.history.SetHostID(hostID)
 
 	// 创建并启动rsync历史同步器
-	homeDir, _ := os.UserHomeDir()
-	historyBaseDir := filepath.Join(homeDir, ".mssh_history")
-	rsyncer := history.NewRsyncSyncer(host, historyBaseDir)
+	rsyncer := history.NewRsyncSyncer(host, hostID)
 	rsyncer.Start()
 
 	// 进入交互模式

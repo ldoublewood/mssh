@@ -2,6 +2,9 @@ package ssh
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -22,11 +25,13 @@ import (
 
 // Client 包装SSH客户端，保存连接信息
 type Client struct {
-	Host      *config.Host
-	SSHClient *ssh.Client
-	Session   *ssh.Session
-	LastUsed  time.Time
-	mu        sync.Mutex
+	Host        *config.Host
+	SSHClient   *ssh.Client
+	Session     *ssh.Session
+	LastUsed    time.Time
+	HostID      string // 唯一主机标识: <主机名>_<用户名>_<主机指纹>
+	Fingerprint string // SSH主机公钥指纹
+	mu          sync.Mutex
 }
 
 // IsConnected 检查连接是否可用
@@ -36,6 +41,11 @@ func (c *Client) IsConnected() bool {
 	}
 	_, _, err := c.SSHClient.SendRequest("keepalive@openssh.com", true, nil)
 	return err == nil
+}
+
+// GetHostID 获取主机唯一标识
+func (c *Client) GetHostID() string {
+	return c.HostID
 }
 
 // Close 关闭连接
@@ -93,12 +103,75 @@ func (p *Pool) GetClient(host *config.Host) (*Client, error) {
 	return client, nil
 }
 
+// knownHostEntry known_hosts 文件中的条目
+type knownHostEntry struct {
+	Fingerprint string `json:"fingerprint"`
+}
+
+// knownHostsFile 返回 known_hosts 文件路径
+func knownHostsFile() string {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".mssh")
+	os.MkdirAll(dir, 0700)
+	return filepath.Join(dir, "known_hosts")
+}
+
+// loadKnownHosts 加载已知主机指纹
+func loadKnownHosts() map[string]string {
+	result := make(map[string]string)
+	path := knownHostsFile()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return result
+	}
+	var entries map[string]knownHostEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return result
+	}
+	for addr, entry := range entries {
+		result[addr] = entry.Fingerprint
+	}
+	return result
+}
+
+// saveKnownHost 保存已知主机指纹
+func saveKnownHost(addr, fingerprint string) {
+	entries := loadKnownHosts()
+	entries[addr] = fingerprint
+	path := knownHostsFile()
+	data, _ := json.MarshalIndent(entries, "", "  ")
+	os.WriteFile(path, data, 0600)
+}
+
+// hostKeyFingerprint 计算主机密钥的SHA256指纹，返回文件系统安全的字符串
+func hostKeyFingerprint(key ssh.PublicKey) string {
+	hash := sha256.Sum256(key.Marshal())
+	encoded := base64.StdEncoding.EncodeToString(hash[:])
+	encoded = strings.NewReplacer("/", "_", "+", "-", "=", "").Replace(encoded)
+	return encoded
+}
+
 // createClient 创建新的SSH连接
 func (p *Pool) createClient(host *config.Host) (*Client, error) {
+	var capturedFingerprint string
+	addr := fmt.Sprintf("%s:%d", host.IP, host.Port)
+
+	knownHosts := loadKnownHosts()
+
 	sshConfig := &ssh.ClientConfig{
-		User:            host.User,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
+		User: host.User,
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			fp := hostKeyFingerprint(key)
+			capturedFingerprint = fp
+
+			if storedFP, known := knownHosts[addr]; known {
+				if storedFP != fp {
+					return fmt.Errorf("主机密钥指纹不匹配: 期望 %s, 实际 %s", storedFP, fp)
+				}
+			}
+			return nil
+		},
+		Timeout: 10 * time.Second,
 	}
 
 	var authMethods []ssh.AuthMethod
@@ -127,16 +200,28 @@ func (p *Pool) createClient(host *config.Host) (*Client, error) {
 
 	sshConfig.Auth = authMethods
 
-	addr := fmt.Sprintf("%s:%d", host.IP, host.Port)
 	sshClient, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
 		return nil, fmt.Errorf("连接 %s 失败: %v", addr, err)
 	}
 
+	// 保存新主机的指纹（TOFU）
+	if capturedFingerprint != "" {
+		if _, known := knownHosts[addr]; !known {
+			saveKnownHost(addr, capturedFingerprint)
+		}
+	} else {
+		capturedFingerprint = "noauth"
+	}
+
+	hostID := fmt.Sprintf("%s_%s_%s", host.Name, host.User, capturedFingerprint)
+
 	return &Client{
-		Host:      host,
-		SSHClient: sshClient,
-		LastUsed:  time.Now(),
+		Host:        host,
+		SSHClient:   sshClient,
+		LastUsed:    time.Now(),
+		HostID:      hostID,
+		Fingerprint: capturedFingerprint,
 	}, nil
 }
 
@@ -189,7 +274,7 @@ func (p *Pool) ExecuteWithOutput(host *config.Host, command string) (string, err
 	return output.String(), err
 }
 
-// StartShell 启动交互式shell（支持Ctrl+R历史搜索）
+// StartShell 启动交互式shell
 func (p *Pool) StartShell(host *config.Host) error {
 	client, err := p.GetClient(host)
 	if err != nil {
@@ -209,14 +294,12 @@ func (p *Pool) StartShell(host *config.Host) error {
 	}
 	defer session.Close()
 
-	// 设置stdin为原始模式
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return fmt.Errorf("设置终端原始模式失败: %v", err)
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	// 获取终端尺寸
 	width, height, _ := term.GetSize(int(os.Stdout.Fd()))
 	if width == 0 {
 		width = 80
@@ -235,7 +318,6 @@ func (p *Pool) StartShell(host *config.Host) error {
 		return fmt.Errorf("请求伪终端失败: %v", err)
 	}
 
-	// 创建pipe用于转发输入/输出
 	stdinPipe, err := session.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("创建stdin管道失败: %v", err)
@@ -255,10 +337,8 @@ func (p *Pool) StartShell(host *config.Host) error {
 		return fmt.Errorf("启动shell失败: %v", err)
 	}
 
-	// 加载所有主机的历史命令
 	historyEntries := p.loadAllHostsHistory()
 
-	// 启动goroutine转发stdout和stderr
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -267,7 +347,7 @@ func (p *Pool) StartShell(host *config.Host) error {
 	go func() {
 		defer wg.Done()
 		io.Copy(os.Stdout, stdoutPipe)
-		close(done) // stdout结束时通知stdin转发退出
+		close(done)
 	}()
 
 	go func() {
@@ -275,13 +355,9 @@ func (p *Pool) StartShell(host *config.Host) error {
 		io.Copy(os.Stderr, stderrPipe)
 	}()
 
-	// 读取stdin并检测Ctrl+R
 	err = p.forwardStdinWithHistory(stdinPipe, host.Name, historyEntries, done)
 
-	// 关闭stdin管道，通知远程shell输入结束
 	stdinPipe.Close()
-
-	// 等待输出转发完成
 	wg.Wait()
 
 	return session.Wait()
@@ -297,26 +373,22 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 	var matches []HistoryEntry
 
 	for {
-		// 检查是否需要退出
 		select {
 		case <-done:
 			return nil
 		default:
 		}
 
-		// 设置超时读取，避免阻塞
 		os.Stdin.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		n, err := os.Stdin.Read(buf)
 		os.Stdin.SetReadDeadline(time.Time{})
 
 		if err != nil {
-			// 检查是否是超时或其他可恢复错误
 			if pathErr, ok := err.(*os.PathError); ok {
 				if errno, ok := pathErr.Err.(syscall.Errno); ok && errno == syscall.EAGAIN {
 					continue
 				}
 			}
-			// 其他错误（如EOF）退出
 			return err
 		}
 
@@ -328,27 +400,23 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 		for i < n {
 			ch := buf[i]
 
-		// 检测Ctrl+R (0x12) - 进入或继续搜索
 			if ch == 0x12 {
 				if !inSearchMode {
-					// 首次进入搜索模式
 					inSearchMode = true
 					searchTerm = ""
 					matchIndex = 0
 					matches = p.findMatches(historyEntries, searchTerm)
 					p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
 				} else {
-					// 已经在搜索模式，跳到下一个匹配
 					if len(matches) > 0 {
 						matchIndex = (matchIndex + 1) % len(matches)
 						p.showSearchStatus(searchTerm, matches, matchIndex, hostName)
 					}
 				}
-			i++
-			continue
-		}
+				i++
+				continue
+			}
 
-			// 检测Ctrl+G (0x07) 或 Ctrl+C (0x03) - 取消搜索
 			if (ch == 0x07 || ch == 0x03) && inSearchMode {
 				inSearchMode = false
 				searchTerm = ""
@@ -358,7 +426,6 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 				continue
 			}
 
-			// 检测回车 - 执行匹配的命令
 			if (ch == '\r' || ch == '\n') && inSearchMode {
 				if len(matches) > 0 && matchIndex < len(matches) {
 					selectedCmd := matches[matchIndex].Command
@@ -375,7 +442,6 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 				continue
 			}
 
-			// 检测退格 - 删除搜索字符
 			if (ch == 0x7F || ch == 0x08) && inSearchMode {
 				if len(searchTerm) > 0 {
 					searchTerm = searchTerm[:len(searchTerm)-1]
@@ -387,7 +453,6 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 				continue
 			}
 
-			// 在搜索模式下，普通字符添加到搜索词
 			if inSearchMode && ch >= 32 && ch < 127 {
 				searchTerm += string(ch)
 				matches = p.findMatches(historyEntries, searchTerm)
@@ -397,7 +462,6 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 				continue
 			}
 
-			// 其他情况：正常转发到远程
 			stdinPipe.Write([]byte{ch})
 			i++
 		}
@@ -417,78 +481,91 @@ func (p *Pool) loadAllHostsHistory() []HistoryEntry {
 		return nil
 	}
 
-	historyDir := filepath.Join(usr.HomeDir, ".mssh_history")
+	// 优先扫描新目录 ~/.mssh/<host_id>/history/
+	msshDir := filepath.Join(usr.HomeDir, ".mssh")
+	entries := loadHistoryFromDir(msshDir)
 
-	// 读取历史目录下的所有子目录（主机）
-	entries, err := os.ReadDir(historyDir)
+	// 兼容旧目录 ~/.mssh_history/<hostname>/
+	oldDir := filepath.Join(usr.HomeDir, ".mssh_history")
+	oldEntries := loadHistoryFromDir(oldDir)
+	entries = append(entries, oldEntries...)
+
+	// 倒序排列（最新的在前）
+	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+		entries[i], entries[j] = entries[j], entries[i]
+	}
+
+	return entries
+}
+
+// loadHistoryFromDir 从指定目录加载所有主机的 history 文件
+func loadHistoryFromDir(baseDir string) []HistoryEntry {
+	var allEntries []HistoryEntry
+
+	hostDirs, err := os.ReadDir(baseDir)
 	if err != nil {
 		return nil
 	}
 
-	var allEntries []HistoryEntry
-
-	for _, entry := range entries {
+	for _, entry := range hostDirs {
 		if !entry.IsDir() {
 			continue
 		}
-
 		hostName := entry.Name()
-		// 跳过logs目录
 		if hostName == "logs" {
 			continue
 		}
 
-		// 尝试读取 .bash_history 或 .zsh_history
-		historyFiles := []string{
-			filepath.Join(historyDir, hostName, ".bash_history"),
-			filepath.Join(historyDir, hostName, ".zsh_history"),
-			filepath.Join(historyDir, hostName, "history.txt"), // 兼容旧格式
-		}
-
-		var file *os.File
+		// 新结构: <host_id>/history/ 下的文件
+		historyDir := filepath.Join(baseDir, hostName, "history")
+		historyFiles, _ := filepath.Glob(filepath.Join(historyDir, "*"))
 		for _, hf := range historyFiles {
-			f, err := os.Open(hf)
-			if err == nil {
-				file = f
-				break
-			}
+			loadHistoryFile(hf, hostName, &allEntries)
 		}
 
-		if file == nil {
-			continue
+		// 旧结构: <hostname>/ 下的文件（直接放在host目录下）
+		oldFiles := []string{
+			filepath.Join(baseDir, hostName, ".bash_history"),
+			filepath.Join(baseDir, hostName, ".zsh_history"),
+			filepath.Join(baseDir, hostName, "history.txt"),
 		}
-
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			cmd := strings.TrimSpace(scanner.Text())
-			if cmd != "" {
-				// zsh 历史格式可能有时间戳前缀，如 : 1234567890:0;command
-				if strings.HasPrefix(cmd, ":") {
-					parts := strings.SplitN(cmd, ";", 2)
-					if len(parts) == 2 {
-						cmd = strings.TrimSpace(parts[1])
-					}
-				}
-				if cmd != "" {
-					allEntries = append(allEntries, HistoryEntry{
-						Command: cmd,
-						Host:    hostName,
-					})
-				}
-			}
+		for _, hf := range oldFiles {
+			loadHistoryFile(hf, hostName, &allEntries)
 		}
-		file.Close()
-	}
-
-	// 倒序排列（最新的在前）
-	for i, j := 0, len(allEntries)-1; i < j; i, j = i+1, j-1 {
-		allEntries[i], allEntries[j] = allEntries[j], allEntries[i]
 	}
 
 	return allEntries
 }
 
-// findMatches 查找匹配的历史命令（返回HistoryEntry列表）
+// loadHistoryFile 读取单个 history 文件
+func loadHistoryFile(path, hostName string, entries *[]HistoryEntry) {
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		cmd := strings.TrimSpace(scanner.Text())
+		if cmd != "" {
+			if strings.HasPrefix(cmd, ":") {
+				parts := strings.SplitN(cmd, ";", 2)
+				if len(parts) == 2 {
+					cmd = strings.TrimSpace(parts[1])
+				}
+			}
+			if cmd != "" {
+				*entries = append(*entries, HistoryEntry{
+					Command: cmd,
+					Host:    hostName,
+				})
+			}
+		}
+	}
+}
+
+// findMatches 查找匹配的历史命令
 func (p *Pool) findMatches(historyEntries []HistoryEntry, searchTerm string) []HistoryEntry {
 	if searchTerm == "" {
 		return historyEntries
@@ -506,10 +583,8 @@ func (p *Pool) findMatches(historyEntries []HistoryEntry, searchTerm string) []H
 	return matches
 }
 
-// showSearchStatus 显示搜索状态（类似bash的反向搜索）
-// 使用\r回到行首覆盖上一行，实现单行更新
+// showSearchStatus 显示搜索状态
 func (p *Pool) showSearchStatus(searchTerm string, matches []HistoryEntry, matchIndex int, currentHost string) {
-	// 清除整行并回到行首
 	fmt.Printf("\r\033[2K")
 
 	if len(matches) == 0 {
@@ -520,10 +595,7 @@ func (p *Pool) showSearchStatus(searchTerm string, matches []HistoryEntry, match
 		}
 	} else {
 		matchedEntry := matches[matchIndex]
-		// 高亮匹配部分
 		highlighted := p.highlightMatch(matchedEntry.Command, searchTerm)
-
-		// 显示格式: (reverse-i-search)`search': [host] command
 		fmt.Printf("(reverse-i-search)`%s': [%s] %s", searchTerm, matchedEntry.Host, highlighted)
 	}
 }
@@ -542,7 +614,6 @@ func (p *Pool) highlightMatch(cmd, searchTerm string) string {
 		return cmd
 	}
 
-	// 使用ANSI颜色高亮匹配部分 (黄色加粗背景)
 	before := cmd[:idx]
 	match := cmd[idx : idx+len(searchTerm)]
 	after := cmd[idx+len(searchTerm):]
