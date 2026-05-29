@@ -25,13 +25,14 @@ import (
 
 // Client 包装SSH客户端，保存连接信息
 type Client struct {
-	Host        *config.Host
-	SSHClient   *ssh.Client
-	Session     *ssh.Session
-	LastUsed    time.Time
-	HostID      string // 唯一主机标识: <主机名>_<用户名>_<主机指纹>
-	Fingerprint string // SSH主机公钥指纹
-	mu          sync.Mutex
+	Host         *config.Host
+	SSHClient    *ssh.Client
+	Session      *ssh.Session
+	LastUsed     time.Time
+	HostID       string // 唯一主机标识: <主机名>_<用户名>_<主机指纹>
+	Fingerprint  string // SSH主机公钥指纹
+	keepaliveCh  chan struct{}
+	mu           sync.Mutex
 }
 
 // IsConnected 检查连接是否可用
@@ -53,6 +54,10 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.keepaliveCh != nil {
+		close(c.keepaliveCh)
+		c.keepaliveCh = nil
+	}
 	if c.Session != nil {
 		c.Session.Close()
 		c.Session = nil
@@ -216,12 +221,30 @@ func (p *Pool) createClient(host *config.Host) (*Client, error) {
 
 	hostID := fmt.Sprintf("%s_%s_%s", host.Name, host.User, capturedFingerprint)
 
+	keepaliveCh := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_, _, err := sshClient.SendRequest("keepalive@openssh.com", true, nil)
+				if err != nil {
+					return
+				}
+			case <-keepaliveCh:
+				return
+			}
+		}
+	}()
+
 	return &Client{
 		Host:        host,
 		SSHClient:   sshClient,
 		LastUsed:    time.Now(),
 		HostID:      hostID,
 		Fingerprint: capturedFingerprint,
+		keepaliveCh: keepaliveCh,
 	}, nil
 }
 
