@@ -19,6 +19,12 @@ import (
 	"mssh/ssh"
 )
 
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+)
+
 const (
 	msshDir           = ".mssh"
 	hostsFileName     = "hosts.ini"
@@ -34,8 +40,15 @@ func main() {
 		asMCP         = flag.Bool("mcp", false, "以MCP服务器模式运行（stdio通信）")
 		keepalive     = flag.Duration("keepalive", daemon.DefaultIdleTimeout, "连接保持时长（如 5m, 30s），0s 禁用")
 		noKeepalive   = flag.Bool("no-keepalive", false, "禁用连接保持功能")
+		showVersion   = flag.Bool("version", false, "显示版本信息")
+		showVersionV  = flag.Bool("V", false, "显示版本信息")
 	)
 	flag.Parse()
+
+	if *showVersion || *showVersionV {
+		fmt.Printf("mssh %s\n  commit:  %s\n  built:   %s\n", Version, Commit, BuildTime)
+		os.Exit(0)
+	}
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
