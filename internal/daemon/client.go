@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -58,6 +59,9 @@ func sendRequest(command, hostsFile, passwordsFile string, sequential bool) (*Re
 
 	var resp Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		if err == io.EOF {
+			return nil, fmt.Errorf("daemon连接意外关闭（命令执行时间可能超过了keepalive超时，尝试增大 --keepalive 参数，如 --keepalive 30m）")
+		}
 		return nil, fmt.Errorf("读取响应失败: %v", err)
 	}
 

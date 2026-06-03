@@ -29,10 +29,11 @@ type Server struct {
 	passFile    string
 	lockFile    *os.File
 
-	mu         sync.Mutex
-	listener   net.Listener
-	lastActive time.Time
-	stopCh     chan struct{}
+	mu          sync.Mutex
+	listener    net.Listener
+	lastActive  time.Time
+	activeCount int
+	stopCh      chan struct{}
 }
 
 // NewServer 创建 daemon 服务端
@@ -137,8 +138,20 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
 	s.mu.Lock()
-	s.lastActive = time.Now()
+	s.activeCount++
+	if s.activeCount == 1 {
+		s.lastActive = time.Now()
+	}
 	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.activeCount--
+		if s.activeCount == 0 {
+			s.lastActive = time.Now()
+		}
+		s.mu.Unlock()
+	}()
 
 	var req Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -190,8 +203,9 @@ func (s *Server) idleChecker() {
 		case <-ticker.C:
 			s.mu.Lock()
 			elapsed := time.Since(s.lastActive)
+			count := s.activeCount
 			s.mu.Unlock()
-			if elapsed >= s.idleTimeout {
+			if count == 0 && elapsed >= s.idleTimeout {
 				s.Stop()
 				return
 			}
