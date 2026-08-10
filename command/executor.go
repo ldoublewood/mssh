@@ -332,7 +332,8 @@ func (e *Executor) executeLogin(hostName string) error {
 	e.history.SetHostID(hostID)
 
 	// 创建并启动rsync历史同步器
-	rsyncer := history.NewRsyncSyncer(host, hostID)
+	// 传入已建立的 SSH 连接，使退出时的最后一次同步复用该连接而非新建连接
+	rsyncer := history.NewRsyncSyncer(host, hostID, client.SSHClient)
 	rsyncer.Start()
 
 	// 进入交互模式

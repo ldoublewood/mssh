@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"mssh/config"
@@ -402,10 +403,28 @@ func (p *Pool) forwardStdinWithHistory(stdinPipe io.WriteCloser, hostName string
 		default:
 		}
 
-		os.Stdin.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		n, err := os.Stdin.Read(buf)
-		os.Stdin.SetReadDeadline(time.Time{})
+		// 用 poll(2) 等待 stdin 可读(带 100ms 超时),以便循环周期性检查 done 通道。
+		// 不能使用 os.Stdin.SetReadDeadline: 该方法对终端(PTY)不生效,
+		// 阻塞的 Read 永远不会因截止时间返回,导致远程会话关闭后无法感知
+		// done 通道而永久挂死(退出时卡住)。
+		fds := []unix.PollFd{{Fd: int32(os.Stdin.Fd()), Events: unix.POLLIN}}
+		if _, pollErr := unix.Poll(fds, 100); pollErr != nil {
+			if pollErr == unix.EINTR {
+				continue
+			}
+			return pollErr
+		}
+		if fds[0].Revents&unix.POLLIN == 0 {
+			// stdin 已挂断或出错:执行一次读取出具体错误后退出转发循环
+			if fds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+				_, err := os.Stdin.Read(buf)
+				return err
+			}
+			// 超时:回到循环顶部重新检查 done 通道
+			continue
+		}
 
+		n, err := os.Stdin.Read(buf)
 		if err != nil {
 			if pathErr, ok := err.(*os.PathError); ok {
 				if errno, ok := pathErr.Err.(syscall.Errno); ok && errno == syscall.EAGAIN {
