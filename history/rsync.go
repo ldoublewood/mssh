@@ -30,8 +30,8 @@ type RsyncSyncer struct {
 	rsyncAvailable bool
 	logger         *log.Logger
 	logFile        *os.File
-	// conn 是登录期间已建立的 SSH 连接，末次同步时复用它读取远程历史文件，
-	// 避免退出时新建一条 SSH 连接带来的明显延迟。
+	// conn 是登录期间已建立的 SSH 连接。远程文件探测、周期同步与退出前
+	// 最后一次同步都复用它读取远程历史文件，避免反复新建连接带来的明显延迟。
 	conn *ssh.Client
 }
 
@@ -117,9 +117,19 @@ func (r *RsyncSyncer) Stop() {
 	}
 }
 
-// syncFinal 执行最后一次同步。
-// 优先复用已建立的 SSH 连接（conn），避免退出时重新建立连接带来的延迟；
+// syncOnce 执行一次同步：优先复用已建立的 SSH 连接（conn），避免重新建连；
 // 无可用连接时回退到独立的 rsync/scp。
+func (r *RsyncSyncer) syncOnce(localFile string) error {
+	if r.conn != nil {
+		return r.syncViaSession(localFile)
+	}
+	if r.rsyncAvailable {
+		return r.syncWithRsync(localFile)
+	}
+	return r.syncWithSCP(localFile)
+}
+
+// syncFinal 执行最后一次同步（尽力而为，由 Stop 在后台调用）
 func (r *RsyncSyncer) syncFinal() error {
 	if r.remoteFile == "" {
 		return nil
@@ -128,13 +138,7 @@ func (r *RsyncSyncer) syncFinal() error {
 	defer r.mu.Unlock()
 
 	localFile := filepath.Join(r.localDir, filepath.Base(r.remoteFile))
-	if r.conn != nil {
-		return r.syncViaSession(localFile)
-	}
-	if r.rsyncAvailable {
-		return r.syncWithRsync(localFile)
-	}
-	return r.syncWithSCP(localFile)
+	return r.syncOnce(localFile)
 }
 
 // syncViaSession 通过已建立的 SSH 连接直接读取远程历史文件并写入本地。
@@ -168,8 +172,7 @@ func (r *RsyncSyncer) syncViaSession(localFile string) error {
 		if err := os.WriteFile(localFile, res.out, 0600); err != nil {
 			return fmt.Errorf("写入本地历史失败: %v", err)
 		}
-		r.lastSyncTime = time.Now()
-		r.logger.Printf("[历史同步] 最后一次同步成功（复用已有连接）: %s\n", filepath.Base(r.remoteFile))
+		r.logger.Printf("[历史同步] 同步成功（复用已有连接）: %s\n", filepath.Base(r.remoteFile))
 		return nil
 	case <-time.After(5 * time.Second):
 		return fmt.Errorf("通过已有连接读取远程历史超时")
@@ -199,13 +202,7 @@ func (r *RsyncSyncer) sync() {
 	defer r.mu.Unlock()
 
 	localFile := filepath.Join(r.localDir, filepath.Base(r.remoteFile))
-	var err error
-	if r.rsyncAvailable {
-		err = r.syncWithRsync(localFile)
-	} else {
-		err = r.syncWithSCP(localFile)
-	}
-	if err != nil {
+	if err := r.syncOnce(localFile); err != nil {
 		r.logger.Printf("[历史同步] 同步失败: %v\n", err)
 	} else {
 		r.lastSyncTime = time.Now()
@@ -271,7 +268,77 @@ func (r *RsyncSyncer) syncWithSCP(localFile string) error {
 	return nil
 }
 
+// detectRemoteHistoryFile 探测远程 shell 与历史文件。
+// 优先复用已建立的 SSH 连接（conn），避免登录时用外部 ssh 命令重新建连；
+// 连接不可用时回退到外部 ssh 命令。
 func (r *RsyncSyncer) detectRemoteHistoryFile() {
+	if r.conn != nil {
+		if err := r.detectViaSession(); err != nil {
+			r.logger.Printf("[历史同步] 通过已有连接探测失败，回退外部ssh: %v\n", err)
+			r.detectViaExternal()
+		}
+		return
+	}
+	r.detectViaExternal()
+}
+
+// detectViaSession 通过已建立的 SSH 连接探测远程 shell 与历史文件。
+// 用单条命令完成探测，尽量减少会话（session）数——部分服务端对每个
+// 新会话都有额外的处理延迟。
+func (r *RsyncSyncer) detectViaSession() error {
+	// 一条命令探测 shell 与两个历史文件；末尾的 true 保证退出码为 0，
+	// 以便文件均不存在时仍能拿到输出（session.Output 遇非零退出码会报错）
+	cmd := "echo $SHELL; test -f ~/.zsh_history && echo ZSH_EXISTS; test -f ~/.bash_history && echo BASH_EXISTS; true"
+	out, err := r.runViaSession(cmd)
+	if err != nil {
+		return fmt.Errorf("通过已有连接探测失败: %v", err)
+	}
+	output := string(out)
+
+	switch {
+	case strings.Contains(output, "ZSH_EXISTS"):
+		r.remoteFile = "~/.zsh_history"
+	case strings.Contains(output, "BASH_EXISTS"):
+		r.remoteFile = "~/.bash_history"
+	case strings.Contains(output, "zsh"):
+		// 两个历史文件都不存在时，按 shell 偏好选择（尽力而为）
+		r.remoteFile = "~/.zsh_history"
+	default:
+		r.remoteFile = "~/.bash_history"
+	}
+	r.logger.Printf("[历史同步] 检测到的远程历史文件: %s\n", r.remoteFile)
+	return nil
+}
+
+// runViaSession 在已建立的 SSH 连接上执行单条命令并返回输出。
+// 通过 5 秒超时兜底，避免服务端不响应 exec 请求导致调用方（登录路径）卡死。
+func (r *RsyncSyncer) runViaSession(cmd string) ([]byte, error) {
+	session, err := r.conn.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("创建SSH会话失败: %v", err)
+	}
+	defer session.Close()
+
+	type sessionResult struct {
+		out []byte
+		err error
+	}
+	resCh := make(chan sessionResult, 1)
+	go func() {
+		out, err := session.Output(cmd)
+		resCh <- sessionResult{out, err}
+	}()
+
+	select {
+	case res := <-resCh:
+		return res.out, res.err
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("通过已有连接执行命令超时: %s", cmd)
+	}
+}
+
+// detectViaExternal 通过外部 ssh 命令探测远程 shell 与历史文件（回退路径）
+func (r *RsyncSyncer) detectViaExternal() {
 	shellCmd := fmt.Sprintf("ssh -p %d -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 %s@%s 'echo $SHELL' 2>/dev/null",
 		r.host.Port, r.host.User, r.host.IP)
 	cmd := exec.Command("sh", "-c", shellCmd)
